@@ -194,6 +194,13 @@ async def ask(question: str, *, verbose: bool = False,
             f"- ask_{name}_agent: {spec.charter}"
             for name, spec in SERVERS.items())
 
+        # Rendered from the session principal, never from the conversation --
+        # the same resolved identity the MCP servers were spawned with.
+        scope = ", ".join(principal.plant_scope) or "all plants"
+        who = (f"{principal.display_name} ({principal.principal_id}), "
+               f"{principal.role.replace('_', ' ')}, scoped to {scope}.\n"
+               f"Capabilities: {', '.join(sorted(principal.capabilities))}.")
+
         runner = client.beta.messages.tool_runner(
             system=COORDINATOR_SYSTEM.format(roster=roster, who=who),
             messages=[{"role": "user", "content": question}],
