@@ -1,0 +1,342 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "PROOF — agentic operations copilot for bakery manufacturing",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1370,
+      880
+    ],
+    "views": [
+      {
+        "id": "delegation",
+        "label": "Delegation path",
+        "focus": [
+          "cli",
+          "coordinator",
+          "mcp_prod",
+          "mcp_inv",
+          "pg"
+        ],
+        "note": "One question fans out from the coordinator to the domain services that own the data."
+      },
+      {
+        "id": "read-only",
+        "label": "Read-only boundary",
+        "focus": [
+          "mcp_prod",
+          "mcp_inv",
+          "mcp_dem",
+          "mcp_qua",
+          "pg"
+        ],
+        "note": "Every service connects as agent_read, which holds no INSERT, UPDATE or DELETE grant."
+      },
+      {
+        "id": "procedure",
+        "label": "Procedure retrieval",
+        "focus": [
+          "mcp_qua",
+          "embed",
+          "pg",
+          "citations"
+        ],
+        "note": "SOP retrieval runs entirely on-host, and every citation is checked before it reaches the coordinator."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "Operator CLI",
+      "sublabel": "Plant floor",
+      "pos": [
+        30,
+        380
+      ],
+      "size": [
+        170,
+        80
+      ]
+    },
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "Claude Opus 5",
+      "sublabel": "Planning + synthesis",
+      "brand": "claude",
+      "pos": [
+        330,
+        150
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "coordinator",
+      "type": "backend",
+      "label": "Coordinator agent",
+      "sublabel": "Sees 4 tools, not 21",
+      "pos": [
+        330,
+        372
+      ],
+      "size": [
+        200,
+        96
+      ]
+    },
+    {
+      "id": "citations",
+      "type": "security",
+      "label": "Citation validator",
+      "sublabel": "Fabricated ⇒ withheld",
+      "pos": [
+        330,
+        640
+      ],
+      "size": [
+        200,
+        92
+      ]
+    },
+    {
+      "id": "mcp_prod",
+      "type": "backend",
+      "label": "proof-production",
+      "sublabel": "MES / SCADA · 6 tools",
+      "pos": [
+        780,
+        120
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "mcp_inv",
+      "type": "backend",
+      "label": "proof-inventory",
+      "sublabel": "WMS + WIP clock · 5 tools",
+      "pos": [
+        780,
+        258
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "mcp_dem",
+      "type": "backend",
+      "label": "proof-demand",
+      "sublabel": "ERP order book · 4 tools",
+      "pos": [
+        780,
+        396
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "mcp_qua",
+      "type": "backend",
+      "label": "proof-quality",
+      "sublabel": "QMS + SOP corpus · 6 tools",
+      "pos": [
+        780,
+        534
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "embed",
+      "type": "cloud",
+      "label": "all-MiniLM-L6-v2",
+      "sublabel": "CPU · no network egress",
+      "pos": [
+        780,
+        700
+      ],
+      "size": [
+        200,
+        84
+      ]
+    },
+    {
+      "id": "pg",
+      "type": "database",
+      "label": "PostgreSQL 16 + pgvector",
+      "sublabel": "ops · scm · qms · docs",
+      "brand": "postgresql",
+      "pos": [
+        1130,
+        330
+      ],
+      "size": [
+        200,
+        110
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "MCP servers — separate stdio subprocesses, one per domain",
+      "wraps": [
+        "mcp_prod",
+        "mcp_inv",
+        "mcp_dem",
+        "mcp_qua"
+      ],
+      "pad": 22
+    },
+    {
+      "kind": "security-group",
+      "label": "agent_read — SELECT only, no write grant exists",
+      "wraps": [
+        "pg"
+      ],
+      "pad": 20
+    }
+  ],
+  "connections": [
+    {
+      "id": "ask",
+      "from": "cli",
+      "to": "coordinator",
+      "label": "operations question",
+      "variant": "emphasis"
+    },
+    {
+      "id": "plan",
+      "from": "coordinator",
+      "to": "claude",
+      "label": "plan fan-out, then compose",
+      "variant": "emphasis"
+    },
+    {
+      "id": "d-prod",
+      "from": "coordinator",
+      "to": "mcp_prod",
+      "label": "ask_production_agent",
+      "labelAt": [
+        720,
+        148
+      ]
+    },
+    {
+      "id": "d-inv",
+      "from": "coordinator",
+      "to": "mcp_inv",
+      "label": "ask_inventory_agent",
+      "labelAt": [
+        720,
+        286
+      ]
+    },
+    {
+      "id": "d-dem",
+      "from": "coordinator",
+      "to": "mcp_dem",
+      "label": "ask_demand_agent",
+      "labelAt": [
+        720,
+        424
+      ]
+    },
+    {
+      "id": "d-qua",
+      "from": "coordinator",
+      "to": "mcp_qua",
+      "label": "ask_quality_agent",
+      "labelAt": [
+        720,
+        562
+      ]
+    },
+    {
+      "id": "r-prod",
+      "from": "mcp_prod",
+      "to": "pg",
+      "label": "SELECT + returned SQL"
+    },
+    {
+      "id": "r-inv",
+      "from": "mcp_inv",
+      "to": "pg"
+    },
+    {
+      "id": "r-dem",
+      "from": "mcp_dem",
+      "to": "pg"
+    },
+    {
+      "id": "r-qua",
+      "from": "mcp_qua",
+      "to": "pg",
+      "label": "hybrid SOP retrieval"
+    },
+    {
+      "id": "q-embed",
+      "from": "mcp_qua",
+      "to": "embed",
+      "label": "embed query on host",
+      "labelDy": 24
+    },
+    {
+      "id": "qa-check",
+      "from": "mcp_qua",
+      "to": "citations",
+      "label": "answer + citations",
+      "variant": "dashed"
+    },
+    {
+      "id": "verdict",
+      "from": "citations",
+      "to": "coordinator",
+      "label": "verified, or withheld",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Why four services, not one agent",
+      "items": [
+        "Coordinator chooses among 4 tools; each sub-agent among 4–6.",
+        "Nobody discriminates between 21 similarly named tools.",
+        "Demand cannot read line state — its session has no such tool."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authorization lives in Postgres",
+      "items": [
+        "agent_read holds SELECT and nothing else.",
+        "A prompt-injected agent still cannot write to a plant table.",
+        "Writes arrive in Phase 4 as a separate role and approval queue."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Every number carries its lineage",
+      "items": [
+        "Each tool returns rows plus the SQL that produced them.",
+        "Procedural claims must cite a retrieved SOP section.",
+        "A fabricated citation replaces the answer rather than annotating it."
+      ]
+    }
+  ]
+}

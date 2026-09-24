@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+data/out/
+*.log
+
+# archify visual-check output (regenerate with `archify visual-check`)
+docs/diagrams/*.visual-check.*
+
+# Tracked diagram stills (promoted from visual-check output)
+!docs/diagrams/proof-architecture.png
+!docs/diagrams/demo1-fanout.png
+
+# Phase 5 trace output (regenerated on every run)
+data/traces/

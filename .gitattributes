@@ -1,0 +1,10 @@
+# Shell scripts and the Makefile MUST be LF.
+#  - A CRLF shebang makes the kernel look for an interpreter literally
+#    named '/bin/bash<CR>', and the postgres entrypoint then fails at
+#    first boot with 'cannot execute: required file not found'.
+#  - A trailing CR on a Makefile recipe line becomes part of the command
+#    make hands to the shell.
+# Both cost an hour the first time. Pinned here so they cannot recur.
+*.sh     text eol=lf
+*.sql    text eol=lf
+Makefile text eol=lf

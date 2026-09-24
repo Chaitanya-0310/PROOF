@@ -1,0 +1,53 @@
+services:
+  # The "plant": one Postgres holding what would really be three systems
+  # (MES, ERP/WMS, QMS) in three schemas. Collapsing them into one database
+  # is a deliberate simplification for the demo -- the schema boundary is
+  # kept strict so that splitting them later is a connection-string change,
+  # not a rewrite.
+  db:
+    # pgvector image, not plain postgres: Phase 3 stores SOP chunk
+    # embeddings in the SAME database as the plant data. One system to
+    # run, one backup, and a retrieval query that can join straight to
+    # ops.lines to filter procedures by the line they apply to.
+    image: pgvector/pgvector:pg16
+    container_name: proof_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-proof}
+      # Passed through so db/init/03_roles.sh can interpolate them.
+      SEEDER_PASSWORD: ${SEEDER_PASSWORD:-seeder_pw}
+      AGENT_READ_PASSWORD: ${AGENT_READ_PASSWORD:-agentread_pw}
+      ACTION_RW_PASSWORD: ${ACTION_RW_PASSWORD:-actionrw_pw}
+      APPROVER_PASSWORD: ${APPROVER_PASSWORD:-approver_pw}
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"   # 5434 on the host: avoids clashing with
+                                        # a local pg AND with governed-datamart's 5433
+    volumes:
+      - proofdata:/var/lib/postgresql/data
+      # Runs ONCE, in filename order, on first boot of an empty volume.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d ${POSTGRES_DB:-proof}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Python workspace: seeder now, MCP servers + agents + API in later phases.
+  app:
+    build: .
+    container_name: proof_app
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+
+volumes:
+  proofdata:

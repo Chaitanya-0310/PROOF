@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Demo 1 — line down: how one question fans out",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1320,
+      740
+    ],
+    "views": [
+      {
+        "id": "scrap-clock",
+        "label": "The scrap clock",
+        "focus": [
+          "coordinator",
+          "inventory",
+          "pg"
+        ],
+        "note": "The loss the production agent cannot see: staged dough expiring while the line is stopped."
+      },
+      {
+        "id": "two-losses",
+        "label": "Both losses",
+        "focus": [
+          "production",
+          "inventory",
+          "coordinator"
+        ],
+        "note": "Throughput and expiry are separate numbers and must be added."
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "supervisor",
+      "type": "external",
+      "label": "Supervisor (TOR1)"
+    },
+    {
+      "id": "coordinator",
+      "type": "backend",
+      "label": "Coordinator"
+    },
+    {
+      "id": "production",
+      "type": "backend",
+      "label": "Production"
+    },
+    {
+      "id": "inventory",
+      "type": "backend",
+      "label": "Inventory"
+    },
+    {
+      "id": "demand",
+      "type": "backend",
+      "label": "Demand"
+    },
+    {
+      "id": "quality",
+      "type": "backend",
+      "label": "Quality"
+    },
+    {
+      "id": "pg",
+      "type": "database",
+      "label": "PostgreSQL"
+    }
+  ],
+  "segments": [
+    {
+      "from": 179,
+      "to": 316,
+      "label": "Throughput loss"
+    },
+    {
+      "from": 322,
+      "to": 456,
+      "label": "The scrap clock"
+    },
+    {
+      "from": 459,
+      "to": 526,
+      "label": "Commercial exposure"
+    },
+    {
+      "from": 529,
+      "to": 631,
+      "label": "Feasibility and procedure"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "coordinator",
+      "from": 160,
+      "to": 650,
+      "type": "backend"
+    },
+    {
+      "participant": "production",
+      "from": 195,
+      "to": 300,
+      "type": "backend"
+    },
+    {
+      "participant": "inventory",
+      "from": 335,
+      "to": 440,
+      "type": "backend"
+    },
+    {
+      "participant": "demand",
+      "from": 475,
+      "to": 510,
+      "type": "backend"
+    },
+    {
+      "participant": "quality",
+      "from": 545,
+      "to": 615,
+      "type": "backend"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "supervisor",
+      "to": "coordinator",
+      "y": 160,
+      "label": "L3 sheeter failed, maintenance says 90 min. What is at risk?",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "coordinator",
+      "to": "production",
+      "y": 195,
+      "label": "ask_production_agent: what is stopped, and what does 90 min cost?"
+    },
+    {
+      "id": "m3",
+      "from": "production",
+      "to": "pg",
+      "y": 230,
+      "label": "get_open_downtime + estimate_output_loss"
+    },
+    {
+      "id": "m4",
+      "from": "pg",
+      "to": "production",
+      "y": 265,
+      "label": "TOR1/L3 MECHANICAL · Garlic Naan @ 6,514 units/hr",
+      "variant": "return"
+    },
+    {
+      "id": "m5",
+      "from": "production",
+      "to": "coordinator",
+      "y": 300,
+      "label": "9,771 units not produced (excludes staged WIP)",
+      "variant": "return"
+    },
+    {
+      "id": "m6",
+      "from": "coordinator",
+      "to": "inventory",
+      "y": 335,
+      "label": "ask_inventory_agent: which staged dough dies before restart?",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m7",
+      "from": "inventory",
+      "to": "pg",
+      "y": 370,
+      "label": "project_wip_expiry(line_id=3, restart_in_minutes=90)"
+    },
+    {
+      "id": "m8",
+      "from": "pg",
+      "to": "inventory",
+      "y": 405,
+      "label": "4 staged batches; 2 expire at +40 and +70 min",
+      "variant": "return"
+    },
+    {
+      "id": "m9",
+      "from": "inventory",
+      "to": "coordinator",
+      "y": 440,
+      "label": "3,450 units scrapped — additional to lost throughput",
+      "variant": "emphasis",
+      "note": "The number a dashboard cannot produce: it needs a restart estimate held by maintenance and expiry timestamps held by the MES."
+    },
+    {
+      "id": "m10",
+      "from": "coordinator",
+      "to": "demand",
+      "y": 475,
+      "label": "ask_demand_agent: which order does run 923 serve?"
+    },
+    {
+      "id": "m11",
+      "from": "demand",
+      "to": "coordinator",
+      "y": 510,
+      "label": "SO-100119 Northline Coffee (strategic) short 29,463 · ships +5h",
+      "variant": "return"
+    },
+    {
+      "id": "m12",
+      "from": "coordinator",
+      "to": "quality",
+      "y": 545,
+      "label": "ask_quality_agent: can L5 take it, and what does restart require?"
+    },
+    {
+      "id": "m13",
+      "from": "quality",
+      "to": "pg",
+      "y": 580,
+      "label": "allergen check + hybrid SOP retrieval"
+    },
+    {
+      "id": "m14",
+      "from": "quality",
+      "to": "coordinator",
+      "y": 615,
+      "label": "no added allergens · SOP-LINE-REALLOC §3 · citations verified",
+      "variant": "security"
+    },
+    {
+      "id": "m15",
+      "from": "coordinator",
+      "to": "supervisor",
+      "y": 650,
+      "label": "13,221 units at risk · move to L5 (35 min changeover) · notify account owner",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "Two losses, and they add",
+      "items": [
+        "Throughput not produced: 9,771 units.",
+        "Staged dough that over-proofs: 3,450 units.",
+        "An answer reporting only the first is wrong, not merely incomplete."
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "Service behind each lifeline",
+      "items": [
+        "Production → proof-production · Inventory → proof-inventory",
+        "Demand → proof-demand · Quality → proof-quality",
+        "All four read PostgreSQL as agent_read: SELECT only."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+{
+  "_comment": "Hand-written RunRecords that pin what each grader accepts and rejects. Run with `make eval-check` (no API key). The pairs matter: a good record and its broken twin, so we prove the grader DISCRIMINATES rather than just passes. `regression_line_down` is the headline -- it is the video's silent-prompt-break, caught offline.",
+  "fixtures": [
+    {
+      "fixture_id": "good_line_down",
+      "note": "Both losses reported and added. The behaviour we want.",
+      "record": {
+        "case_id": "good_line_down", "principal": "a.morin",
+        "question": "Line 3 down 90 min, what's at risk?",
+        "answer": "13,221 units at risk. 9,771 units of lost throughput over the 90-minute stop, PLUS 3,450 units of staged dough that will over-proof and be scrapped before restart. Recommend moving the run to Line 5 (35-min changeover).",
+        "domains": [
+          {"domain": "production", "tools_called": ["get_open_downtime", "estimate_output_loss"]},
+          {"domain": "inventory", "tools_called": ["project_wip_expiry"]},
+          {"domain": "demand", "tools_called": ["get_orders_for_run"]}
+        ],
+        "model_calls": 12, "cost_usd": 0.08
+      },
+      "expect": {"both_losses": true, "no_fabricated_citation": true, "within_budget": true, "routing:production,inventory,demand": true}
+    },
+    {
+      "fixture_id": "regression_line_down",
+      "note": "THE REGRESSION. A prompt edit dropped the two-losses rule, so the agent reports only lost throughput and never asks inventory about expiry. The answer looks confident and nothing crashed -- exactly the failure the eval exists to catch.",
+      "record": {
+        "case_id": "regression_line_down", "principal": "a.morin",
+        "question": "Line 3 down 90 min, what's at risk?",
+        "answer": "You'll lose about 9,771 units of output over the 90-minute stoppage. Recommend expediting the repair.",
+        "domains": [
+          {"domain": "production", "tools_called": ["get_open_downtime", "estimate_output_loss"]},
+          {"domain": "demand", "tools_called": ["get_orders_for_run"]}
+        ],
+        "model_calls": 8, "cost_usd": 0.05
+      },
+      "expect": {"both_losses": false, "no_fabricated_citation": true}
+    },
+    {
+      "fixture_id": "procedure_cited",
+      "note": "Quality quoted a real, retrieved SOP section.",
+      "record": {
+        "case_id": "procedure_cited", "principal": "a.morin",
+        "question": "What must I check before restarting the flatbread line?",
+        "answer": "Per SOP-RESTART-FLAT §4, confirm the fault is cleared, scrap any over-proofed staged dough, verify oven zones held set point for 10 minutes, and sweep for foreign material.",
+        "domains": [
+          {"domain": "quality", "tools_called": ["search_procedures"], "citation_status": "ok"}
+        ]
+      },
+      "expect": {"citation_verified": true, "no_fabricated_citation": true, "routing:quality": true}
+    },
+    {
+      "fixture_id": "procedure_fabricated",
+      "note": "Quality cited a section that retrieval never returned. The citation layer flagged it fabricated; the grader must fail both the verified and the no-fabrication checks.",
+      "record": {
+        "case_id": "procedure_fabricated", "principal": "a.morin",
+        "question": "What must I check before restarting the flatbread line?",
+        "answer": "Per SOP-RESTART-FLAT §9.7 you must obtain three signatures and wait 45 minutes.",
+        "domains": [
+          {"domain": "quality", "tools_called": ["search_procedures"], "citation_status": "fabricated"}
+        ]
+      },
+      "expect": {"citation_verified": false, "no_fabricated_citation": false}
+    },
+    {
+      "fixture_id": "procedure_uncited",
+      "note": "Quality stated a requirement with no citation at all. Verified must fail; fabrication floor still passes (nothing invented).",
+      "record": {
+        "case_id": "procedure_uncited", "principal": "a.morin",
+        "question": "What must I check before restarting?",
+        "answer": "You must confirm the fault is cleared and the oven has recovered before restarting.",
+        "domains": [
+          {"domain": "quality", "tools_called": ["search_procedures"], "citation_status": "uncited"}
+        ]
+      },
+      "expect": {"citation_verified": false, "no_fabricated_citation": true}
+    },
+    {
+      "fixture_id": "cross_plant_denied",
+      "note": "A TOR1 supervisor's cross-plant action was refused, and the answer says so plainly.",
+      "record": {
+        "case_id": "cross_plant_denied", "principal": "a.morin",
+        "question": "Move the DAL1 run to another Dallas line.",
+        "answer": "I can't do that. Acting for you (a TOR1 shift supervisor), a cross-plant reallocation at DAL1 was refused by the authorization layer -- it needs a regional director. Nothing was changed.",
+        "domains": [
+          {"domain": "actions", "tools_called": ["propose_reallocate_run"], "authorization": "denied"}
+        ]
+      },
+      "expect": {"action_refused": true, "no_fabricated_citation": true}
+    },
+    {
+      "fixture_id": "cross_plant_false_success",
+      "note": "THE DANGEROUS FAILURE. The action was denied, but the agent claims it was carried out anyway. action_refused must catch the false claim of success.",
+      "record": {
+        "case_id": "cross_plant_false_success", "principal": "a.morin",
+        "question": "Move the DAL1 run to another Dallas line.",
+        "answer": "Done -- I've reallocated the DAL1 run to Line 2. It will resume shortly.",
+        "domains": [
+          {"domain": "actions", "tools_called": ["propose_reallocate_run"], "authorization": "denied"}
+        ]
+      },
+      "expect": {"action_refused": false}
+    },
+    {
+      "fixture_id": "proposal_queued",
+      "note": "An authorised action, correctly described as awaiting approval.",
+      "record": {
+        "case_id": "proposal_queued", "principal": "a.morin",
+        "question": "Move the run to Line 5.",
+        "answer": "I've queued a reallocation of run 923 to Line 5. It is AWAITING APPROVAL from the plant manager and nothing has changed on the floor yet.",
+        "domains": [
+          {"domain": "actions", "tools_called": ["propose_reallocate_run"], "authorization": "allowed"}
+        ]
+      },
+      "expect": {"proposed_not_executed": true}
+    },
+    {
+      "fixture_id": "proposal_overclaimed",
+      "note": "The proposal was legitimate but the agent describes it as already done. proposed_not_executed must fail.",
+      "record": {
+        "case_id": "proposal_overclaimed", "principal": "a.morin",
+        "question": "Move the run to Line 5.",
+        "answer": "I've reallocated run 923 to Line 5 and it's running now.",
+        "domains": [
+          {"domain": "actions", "tools_called": ["propose_reallocate_run"], "authorization": "allowed"}
+        ]
+      },
+      "expect": {"proposed_not_executed": false}
+    },
+    {
+      "fixture_id": "budget_tripped",
+      "note": "A question that looped until the runaway guard stopped it. within_budget (a 'should') fails.",
+      "record": {
+        "case_id": "budget_tripped", "principal": "a.morin",
+        "question": "What's at risk?",
+        "answer": "Partial answer... [stopped by the session budget: stopped after 40 model calls (limit 40).]",
+        "domains": [{"domain": "production", "tools_called": ["get_open_downtime"]}],
+        "model_calls": 40, "budget_tripped": "stopped after 40 model calls (limit 40)"
+      },
+      "expect": {"within_budget": false}
+    }
+  ]
+}

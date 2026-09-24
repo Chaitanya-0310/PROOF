@@ -1,0 +1,33 @@
+# --- Core DB access ---
+psycopg[binary]==3.2.3       # psycopg 3; used by the seeder, MCP servers and API
+python-dotenv==1.0.1         # load .env for local (non-docker) runs
+
+# --- Phase 2: agents + MCP ---
+# anthropic[mcp] pulls the MCP tool-conversion helpers (async_mcp_tool), which
+# bridge an MCP session's tools straight into the SDK tool runner.
+anthropic[mcp]==1.7.0
+mcp==2.2.0                   # NOTE: 2.x renamed FastMCP -> MCPServer and moved
+                             # protocol model fields to snake_case. 1.x code
+                             # will not run against this.
+
+# --- Phase 3: procedural retrieval ---
+# CPU-only embeddings. No document text leaves the machine to build the
+# index -- the same argument the Phase 4 hybrid LLM split makes, one layer
+# down. This pulls torch (~200MB); it is the heaviest install in the repo.
+# The lexical arm and the vector store are Postgres (pgvector), so there is
+# no separate search service to run.
+sentence-transformers==6.1.0
+
+# --- Phase 5: observability + evals ---
+# Vendor-neutral OpenTelemetry. Spans export to a local JSONL file by default;
+# set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY and the OTLP exporter also
+# ships them to Langfuse (self-hosted or cloud) with no code change.
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+
+# --- Frontend layer: the operator console API ---
+# The React SPA in web/ is a separate npm project; this is the JSON
+# backend it calls. It reuses the tools/authz/coordinator directly --
+# no business logic of its own.
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
