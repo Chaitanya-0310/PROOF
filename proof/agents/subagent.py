@@ -45,6 +45,7 @@ Rules:
   answer, not to a human. No preamble, no restating the question.
 - When a tool result includes a `note`, treat it as a binding caveat and
   reflect it in your answer.
+- You MUST briefly explain your reasoning in text before making any tool call.
 """
 
 
@@ -102,7 +103,8 @@ class SubAgentResult:
 
 async def run_subagent(spec: ServerSpec, session: ClientSession,
                        question: str, client: AsyncAnthropic,
-                       budget: "SessionBudget | None" = None) -> SubAgentResult:
+                       budget: "SessionBudget | None" = None,
+                       streamer: Any = None) -> SubAgentResult:
     """Run one domain sub-agent against its MCP server.
 
     A `delegate` span wraps the whole call and every turn's tokens roll up
@@ -139,18 +141,28 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
                               message.usage.output_tokens)
                 budget.check()  # raises BudgetExceeded; caught by coordinator
 
+            text_blocks = [b.text.strip() for b in message.content
+                           if b.type == "text" and b.text.strip()]
+            thinking_blocks = [getattr(b, "thinking", "").strip() for b in message.content
+                               if b.type == "thinking" and getattr(b, "thinking", "").strip()]
+            
+            explanations = thinking_blocks or text_blocks
+            if text_blocks:
+                final_text = text_blocks
+
             turn_calls = [b for b in message.content if b.type == "tool_use"]
             for block in turn_calls:
+                explanation = "\n".join(explanations) if explanations else None
                 calls.append({"tool": block.name, "args": block.input,
+                              "explanation": explanation,
                               "row_count": None, "sql": None})
-
-            # Only the LAST turn's text is the answer. Earlier turns are the
-            # model narrating its plan before calling tools; concatenating all
-            # of them buries the conclusion.
-            text = [b.text.strip() for b in message.content
-                    if b.type == "text" and b.text.strip()]
-            if text:
-                final_text = text
+                if streamer:
+                    await streamer.emit("tool_call", {
+                        "domain": spec.domain,
+                        "tool": block.name,
+                        "args": block.input,
+                        "explanation": explanation
+                    })
 
             # Pull the tool results for THIS turn. generate_tool_call_response
             # is the runner's only public window onto what the tools returned;
@@ -160,7 +172,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
             # re-run the tools.
             if turn_calls:
                 raw_results.extend(
-                    _attach_turn_results(runner, calls[-len(turn_calls):]))
+                    await _attach_turn_results(runner, calls[-len(turn_calls):]))
 
         answer = "\n".join(final_text) or "(no answer produced)"
 
@@ -200,7 +212,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
     )
 
 
-def _attach_turn_results(runner: Any,
+async def _attach_turn_results(runner: Any,
                          turn_calls: list[dict[str, Any]]) -> list[str]:
     """Attach row_count and SQL from this turn's tool results.
 
@@ -211,7 +223,7 @@ def _attach_turn_results(runner: Any,
     this stayed broken.
     """
     try:
-        response = runner.generate_tool_call_response()
+        response = await runner.generate_tool_call_response()
     except Exception as exc:  # noqa: BLE001
         for call in turn_calls:
             call["evidence_error"] = f"{type(exc).__name__}: {exc}"
