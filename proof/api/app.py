@@ -23,6 +23,7 @@ import os
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -206,8 +207,9 @@ class AskBody(BaseModel):
 
 
 def _model_configured() -> bool:
-    return bool(os.getenv("OPENROUTER_API_KEY")
-                or os.getenv("ANTHROPIC_API_KEY")
+    # The same check as the CLI's preflight: the coordinator runs on the
+    # Anthropic SDK, so only its credentials make Ask work.
+    return bool(os.getenv("ANTHROPIC_API_KEY")
                 or os.getenv("ANTHROPIC_AUTH_TOKEN"))
 
 
@@ -215,41 +217,59 @@ def _model_configured() -> bool:
 def ask_status() -> dict:
     """Whether the chat can actually answer yet -- the UI reads this to decide
     between an enabled composer and a 'connect a model' banner."""
+    from proof.agents.config import COORDINATOR_MODEL
+
     return {
         "model_configured": _model_configured(),
-        "coordinator_model": os.getenv("PROOF_COORDINATOR_MODEL", "(unset)"),
+        "coordinator_model": COORDINATOR_MODEL,
     }
 
 
 @app.post("/api/ask")
 async def ask_question(body: AskBody,
-                       p: Principal = Depends(current_principal)) -> dict:
-    """Run the coordinator for one question, as the header's principal.
-
-    Returns 503 with a clear message when no model is configured -- the whole
-    read-only and approvals surface still works, so the console is useful even
-    before a key is added.
-    """
+                       p: Principal = Depends(current_principal)):
     if not _model_configured():
         raise HTTPException(
             status_code=503,
-            detail="No LLM configured. Set OPENROUTER_API_KEY (DeepSeek) in "
-                   ".env to enable Ask. The dashboard and approvals work "
-                   "without it.")
+            detail="No LLM configured. Set ANTHROPIC_API_KEY in .env to "
+                   "enable Ask. The dashboard and approvals work without it.")
 
     from proof.agents.coordinator import ask
+    from proof.agents.events import EventStreamer
+    import asyncio
 
-    result = await ask(body.question, principal=p)
-    return {
-        "answer": result.answer,
-        "principal": p.principal_id,
-        "delegations": [{
-            "domain": r.domain,
-            "tools": [c["tool"] for c in r.tool_calls],
-            "citation_status": r.citation_status,
-            "authorization": getattr(r, "authorization", "allowed"),
-        } for r in result.subagent_results],
-        "cost_usd": round(result.budget.cost_usd, 4) if result.budget else None,
-        "model_calls": result.budget.model_calls if result.budget else None,
-        "budget_tripped": result.budget.tripped if result.budget else None,
-    }
+    streamer = EventStreamer()
+    
+    async def run_coordinator():
+        try:
+            result = await ask(body.question, principal=p, streamer=streamer)
+            final_data = {
+                "answer": result.answer,
+                "principal": p.principal_id,
+                "delegations": [{
+                    "domain": r.domain,
+                    "tools": [{"name": c["tool"], "explanation": c.get("explanation")} for c in r.tool_calls],
+                    "citation_status": r.citation_status,
+                    "authorization": getattr(r, "authorization", "allowed"),
+                } for r in result.subagent_results],
+                "cost_usd": round(result.budget.cost_usd, 4) if result.budget else None,
+                "model_calls": result.budget.model_calls if result.budget else None,
+            }
+            await streamer.end(final_data)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()  # Keep full traceback in server logs
+            
+            # Drill down through nested ExceptionGroups to find the real error
+            def get_deepest_error(exc):
+                if hasattr(exc, "exceptions") and exc.exceptions:
+                    return get_deepest_error(exc.exceptions[0])
+                return exc
+                
+            deepest = get_deepest_error(e)
+            error_msg = f"{type(deepest).__name__}: {str(deepest)}"
+            
+            await streamer.error(error_msg)
+            
+    asyncio.create_task(run_coordinator())
+    return StreamingResponse(streamer.stream(), media_type="text/event-stream")

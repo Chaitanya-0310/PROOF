@@ -144,7 +144,8 @@ async def _open_session(stack: AsyncExitStack, spec: ServerSpec,
 
 
 async def ask(question: str, *, verbose: bool = False,
-              principal: Principal | None = None) -> CoordinatorResult:
+              principal: Principal | None = None,
+              streamer: Any = None) -> CoordinatorResult:
     """Answer an operations question by planning across the five domains."""
     principal = principal or resolve()
     client = AsyncAnthropic()
@@ -154,9 +155,13 @@ async def ask(question: str, *, verbose: bool = False,
     # stay under its own max_iterations while the total runs away.
     budget = SessionBudget()
 
-    async with AsyncExitStack() as stack, span(
+    async with AsyncExitStack() as stack:
+        # span() is a sync context manager, so it cannot sit in the `async
+        # with` itself. Entered first on the stack, it closes last -- after
+        # every MCP session below has shut down.
+        session_span = stack.enter_context(span(
             "session", "session", principal=principal.principal_id,
-            model=COORDINATOR_MODEL) as session_span:
+            model=COORDINATOR_MODEL))
         # All five servers come up before the coordinator plans. Lazy-starting
         # them per delegation would put subprocess spawn latency inside the
         # agent loop, where it is indistinguishable from the model thinking.
@@ -166,11 +171,28 @@ async def ask(question: str, *, verbose: bool = False,
         def make_delegate(domain: str):
             spec = SERVERS[domain]
 
-            async def delegate(question: str) -> str:
+            async def delegate(delegate_question: str) -> str:
                 if verbose:
-                    print(f"  -> {domain} agent: {question}", file=sys.stderr)
+                    print(f"  -> {domain} agent: {delegate_question}", file=sys.stderr)
+                
+                if streamer:
+                    await streamer.emit("delegate_start", {"domain": domain, "question": delegate_question})
+                
+                from proof.agents.cache import get_cached_quality_response, set_cached_quality_response
+                cached_result = get_cached_quality_response(domain, question)
+                if cached_result:
+                    cached_result.answer = f"[Semantic Cache Hit]\n{cached_result.answer}"
+                    collected.append(cached_result)
+                    if verbose:
+                        print(f"  <- {domain} agent (CACHED): "
+                              f"{len(cached_result.tool_calls)} tool call(s)", file=sys.stderr)
+                    return cached_result.as_tool_result()
+
                 result = await run_subagent(
-                    spec, sessions[domain], question, client, budget)
+                    spec, sessions[domain], delegate_question, client, budget, streamer)
+                
+                set_cached_quality_response(domain, question, result)
+                    
                 collected.append(result)
                 if verbose:
                     print(f"  <- {domain} agent: "
