@@ -14,7 +14,7 @@ privilege, human approval on every write, evaluation gates, and tracing.
 views, light/dark, PNG/SVG export. Source spec:
 [`proof-architecture.json`](docs/diagrams/proof-architecture.json).
 
-**Status: Phase 1 of 8 complete.** Each phase is a tagged release with a demo.
+**Status: Phase 6 of 8 complete.** Each phase is a tagged release with a demo.
 
 ---
 
@@ -713,6 +713,14 @@ re-implementing the rules.
 `/api/ask` calls `coordinator.ask()` — so when the LLM backend moves from one
 provider to another, the API and the React app are unchanged. The provider
 boundary sits entirely below the view layer.
+
+### Recent Architecture & UX Improvements
+To make the application robust and production-ready, several significant UX and performance upgrades have been implemented. See [`SYSTEM_IMPROVEMENTS.md`](SYSTEM_IMPROVEMENTS.md) for full details:
+- **Real-Time SSE Streaming:** The backend streams `delegate_start`, `tool_call`, and `final` events live, eliminating spinner fatigue and offering a dynamic, ChatGPT-style interface.
+- **Exact-Match Semantic Caching:** A Redis-backed query hash intercepts repeat questions instantly ($0 cost, near-zero latency) while securely preventing fuzzy-match false positives between similar plant names (e.g., TOR1 vs TOR2).
+- **Explicit Agent Reasoning:** Mock models are forced to emit a textual explanation before generating JSON tool calls, giving human operators full transparency into *why* an action is being proposed.
+- **UI State Preservation:** Switching identity roles in the UI preserves the chat history while loading the new role's pending actions, enabling seamless approval workflows.
+- **Exception Unwrapping:** Deep `asyncio.TaskGroup` tracebacks are parsed into clean, single-line actionable alerts for the frontend.
 
 ---
 
