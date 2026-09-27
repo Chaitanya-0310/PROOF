@@ -85,7 +85,7 @@ as a no-install fallback:
 | **4** | Identity, plant-scoped authz, action queue with human approval | ✅ done |
 | **5** | Behavioural evals, OpenTelemetry tracing, cost + runaway guard | ✅ done |
 | **UI** | Operator console — React SPA over a FastAPI API | ✅ done |
-| 6 | Baseline harness: time-to-decision, scrap avoided | |
+| **6** | Baseline harness: time-to-decision, scrap avoided | ✅ done |
 | 7 | Finetuned reason-code classifier vs prompting | |
 | 8 | Edge layer: rate limits, gateway | |
 
@@ -713,6 +713,114 @@ re-implementing the rules.
 `/api/ask` calls `coordinator.ask()` — so when the LLM backend moves from one
 provider to another, the API and the React app are unchanged. The provider
 boundary sits entirely below the view layer.
+
+---
+
+## Phase 6 — the baseline harness
+
+The phase that turns "it answers faster" into a number. Two metrics, computed
+from the planted scenarios, with the same determinism and honesty convention as
+the rest of the project.
+
+```bash
+make baseline         # offline, no API key
+make baseline-live    # runs the agent, measures real response time (needs key)
+```
+
+### Scrap avoided
+
+The core value metric. For each stopped line:
+
+1. Read the staged WIP batches and their proof-window expiries.
+2. Read the best alternate line and its changeover cost.
+3. Compute each batch's **salvage deadline**: the latest moment a reallocation
+   decision can begin and still get the alternate line through changeover
+   before the batch over-proofs.
+4. Under PROOF (awareness at ~2 min) vs the manual phone-tree (awareness at
+   ~35 min), determine which batches are discovered in time to salvage.
+
+The headline number from the planted Demo 1 scenario:
+
+```
+  WIP-S1-001   1,800 units   expires in 40m   salvage deadline:  9m
+    PROOF: YES (9m ≥ 2m)    manual: NO (9m < 35m)   → 1,800 units SAVED
+  WIP-S1-002   1,650 units   expires in 70m   salvage deadline: 39m
+    PROOF: YES (39m ≥ 2m)   manual: YES (39m ≥ 35m)  (both save)
+
+  total scrap avoided:   1,800 units (1 batch)
+  savings rate:            52% of expiring WIP
+```
+
+The batch that expires soonest is exactly the one the manual process misses.
+The number is conservative: it assumes a single alternate line, counts only
+batches that die on the current line, and does not credit a faster changeover
+on a second line.
+
+### Time-to-decision
+
+```
+  agent:    2.0 min  (estimated offline, measured with --live)
+  manual:  35.0 min  (parameterised, industry range 30–45)
+  ratio:   17.5x faster
+```
+
+The manual delay is from the README's opening statement: "forty minutes of
+phone calls". 35 is the midpoint; the harness accepts `--manual-delay` to
+sweep it. The agent's time is estimated at 2 minutes offline, or measured from
+the OTel trace when running `make baseline-live`.
+
+### What the harness asserts
+
+```
+  [PASS] scrap-avoided metric is computable for the planted scenario
+  [PASS] at least one WIP batch is saveable by PROOF but not manually  (got 1)
+  [PASS] exactly 2 batches expire before restart  (got 2)
+  [PASS] WIP scrap from expiry is 3,450 units  (got 3450)
+  [PASS] scrap avoided is 1,800 units (1 batch)  (got 1800)
+  [PASS] alternate line exists and changeover is known  (L5, 31m)
+  [PASS] throughput loss is positive  (10221 units)
+  [PASS] total at-risk includes both losses  (13671 = 10221 + 3450)
+  [PASS] time-to-decision ratio exceeds 10x  (17.5x)
+  [PASS] late PO is visible  (1 late PO(s))
+  [PASS] material runout is projectable
+  [PASS] scrap trend deterioration is detectable  (+0.71pp)
+  12/12 passed
+```
+
+All twelve assertions run against the database alone, with no model involved.
+The assertions pin specific values (1,800 units, 3,450 units) for the same
+reason the Phase 2 smoke tests do: a number that drifts silently is worse than
+no number at all.
+
+### Scenario coverage
+
+All three planted scenarios contribute, each measuring a different kind of
+awareness gap:
+
+| Scenario | Metric | Agent value |
+|---|---|---|
+| **line_down** | scrap avoided (WIP expiry) | 1,800 units salvageable |
+| **supplier_slip** | awareness of supply gap | runout known 33 min earlier |
+| **scrap_signal** | trend detection time | +0.71pp caught immediately vs next monthly review |
+
+The line_down scenario is the only one with a computable scrap-avoided number.
+The supplier slip and scrap signal measure time-to-awareness, which is
+valuable but harder to dollarise without assumptions the harness does not make.
+
+### Honest limits
+
+- Manual awareness delay of 35 min is parameterised, not measured in a real
+  plant.
+- Agent response time of 2 min is estimated from demo runs; `make
+  baseline-live` replaces it with the measured value.
+- Scrap avoided assumes the single best alternate line is used; whether the
+  operator actually moves the batch is a decision, not an outcome.
+- The salvage deadline assumes changeover is the only lead time; in reality
+  the batch also needs to physically move and the oven needs to be ready.
+- Three scenarios, one with a scrap clock. A production baseline needs 20+
+  situations across shift patterns and product mixes.
+- No dollar value assigned per unit. The right number depends on the product
+  and whether scrap has a secondary use.
 
 ---
 
