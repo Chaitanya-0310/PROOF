@@ -55,5 +55,41 @@ export const api = {
   decide: (id, event, note) =>
     request(`/api/actions/${id}/decision`, { method: "POST", body: { event, note } }),
   askStatus: () => request("/api/ask/status"),
-  ask: (question) => request("/api/ask", { method: "POST", body: { question } }),
+  ask: async (question, onEvent) => {
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Proof-Principal": getPrincipal(),
+      },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let message = `${res.status} ${res.statusText}`;
+      try { message = JSON.parse(text).detail || message; } catch (e) {}
+      throw new Error(message);
+    }
+    
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop(); // keep the last incomplete chunk
+      
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data = JSON.parse(line.substring(6));
+          if (data.type === "final") return data.data;
+          if (data.type === "error") throw new Error(data.data.message);
+          if (onEvent) onEvent(data);
+        }
+      }
+    }
+  },
 };

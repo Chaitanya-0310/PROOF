@@ -1,35 +1,23 @@
 import React, { useEffect, useState } from "react";
 import TopBar from "./components/TopBar.jsx";
-import Ask from "./views/Ask.jsx";
+import Chat from "./views/Chat.jsx";
 import Dashboard from "./views/Dashboard.jsx";
-import Approvals from "./views/Approvals.jsx";
 import { api, getPrincipal, setPrincipal } from "./api.js";
 
 const TABS = [
-  { id: "ask", label: "Ask" },
-  { id: "dashboard", label: "Dashboard" },
-  { id: "approvals", label: "Approvals" },
+  { id: "dashboard", label: "Dashboard", icon: "◉" },
+  { id: "chat", label: "Agent", icon: "◈" },
 ];
 
 export default function App() {
   const [principals, setPrincipals] = useState([]);
   const [current, setCurrent] = useState(getPrincipal());
   const [tab, setTab] = useState("dashboard");
-  const [pendingCount, setPendingCount] = useState(null);
   const [fatal, setFatal] = useState(null);
 
   useEffect(() => {
     api.principals().then(setPrincipals).catch((e) => setFatal(e.message));
   }, []);
-
-  // Re-read the pending count whenever the acting principal or tab changes, so
-  // the Approvals tab badge reflects the current scope.
-  useEffect(() => {
-    api
-      .pending()
-      .then((d) => setPendingCount(d.rows.length))
-      .catch(() => setPendingCount(null));
-  }, [current, tab]);
 
   function switchPrincipal(id) {
     setPrincipal(id);
@@ -62,19 +50,20 @@ export default function App() {
             className={"tab" + (tab === t.id ? " active" : "")}
             onClick={() => setTab(t.id)}
           >
+            <span style={{ marginRight: 6, fontSize: 10, opacity: 0.7 }}>
+              {t.icon}
+            </span>
             {t.label}
-            {t.id === "approvals" && pendingCount > 0 && (
-              <span className="pill">{pendingCount}</span>
-            )}
           </button>
         ))}
       </div>
-      <div className="wrap">
-        {/* principalKey forces each view to reload when the acting user changes */}
-        {tab === "ask" && <Ask principalKey={current} />}
-        {tab === "dashboard" && <Dashboard principalKey={current} />}
-        {tab === "approvals" && <Approvals principalKey={current} />}
-      </div>
+      {/* Dashboard uses the standard wrap; Chat uses its own full-height layout */}
+      {tab === "dashboard" && (
+        <div className="wrap">
+          <Dashboard principalKey={current} />
+        </div>
+      )}
+      {tab === "chat" && <Chat principalKey={current} />}
     </>
   );
 }
