@@ -9,6 +9,10 @@ anthropic[mcp]==1.7.0
 mcp==2.2.0                   # NOTE: 2.x renamed FastMCP -> MCPServer and moved
                              # protocol model fields to snake_case. 1.x code
                              # will not run against this.
+redis==5.0.3                 # Redis client for semantic cache
+# Pulled in by mcp -> pyjwt[crypto]. 49+ ships no Intel-macOS wheel, and the
+# source build needs a Rust + OpenSSL toolchain. 48.x is universal2.
+cryptography<49; sys_platform == "darwin" and platform_machine == "x86_64"
 
 # --- Phase 3: procedural retrieval ---
 # CPU-only embeddings. No document text leaves the machine to build the
@@ -17,6 +21,14 @@ mcp==2.2.0                   # NOTE: 2.x renamed FastMCP -> MCPServer and moved
 # The lexical arm and the vector store are Postgres (pgvector), so there is
 # no separate search service to run.
 sentence-transformers==6.1.0
+# Intel-macOS (x86_64) ceiling. PyTorch's last x86_64 macOS wheel is 2.2.2,
+# which pins the rest: transformers 5.0.0 is the only 5.x (as
+# sentence-transformers 6 requires) still accepting torch 2.2, and torch 2.2
+# was built against numpy 1.x. The markers keep Linux (the Docker image)
+# and Apple Silicon on current versions.
+torch==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64"
+transformers==5.0.0; sys_platform == "darwin" and platform_machine == "x86_64"
+numpy<2; sys_platform == "darwin" and platform_machine == "x86_64"
 
 # --- Phase 5: observability + evals ---
 # Vendor-neutral OpenTelemetry. Spans export to a local JSONL file by default;
