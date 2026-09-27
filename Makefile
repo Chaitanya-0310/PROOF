@@ -23,6 +23,7 @@ PY      = uv run python
 .PHONY: help up down reset logs psql shell install seed scenario verify
 .PHONY: smoke smoke-mcp smoke-rag smoke-authz index ask demo1 demo2 demo3
 .PHONY: pending approve reject smoke-trace eval-check eval
+.PHONY: baseline baseline-live
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -110,6 +111,17 @@ eval-check: ## Phase 5 -- prove the graders discriminate, offline (no API key)
 
 eval: ## Phase 5 -- run the golden set through the agent (needs a key)
 	$(PY) -m evals.run $(if $(CASE),--case $(CASE),)
+
+# --- Phase 6: baseline harness ----------------------------------------
+# The offline target needs NO API key -- it computes scrap-avoided and
+# time-to-decision from the planted scenarios using the database alone.
+# The live target runs the coordinator and measures real agent response time.
+
+baseline: ## Phase 6 -- scrap avoided + time-to-decision, offline (no API key)
+	$(PY) scripts/run_baseline.py
+
+baseline-live: ## Phase 6 -- same, but runs the agent to measure real time (needs a key)
+	$(PY) scripts/run_baseline.py --live
 
 # --- Frontend: operator console (React SPA + FastAPI) --------------------
 # Run these in two terminals: `make api` then `make web`, and open :5173.
