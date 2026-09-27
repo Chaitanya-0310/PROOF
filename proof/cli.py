@@ -57,14 +57,17 @@ def preflight() -> str | None:
     return None
 
 
-async def run(question: str, verbose: bool) -> int:
+async def run(question: str, verbose: bool, principal_id: str | None) -> int:
+    principal = resolve(principal_id)
     with connect("agent_read") as conn:
         now = sim_now(conn)
     print(f"sim now: {now.isoformat()}")
+    print(f"acting as: {principal.display_name} ({principal.principal_id}, "
+          f"{principal.role})")
     print(f"question: {question}\n")
 
     started = time.monotonic()
-    result = await ask(question, verbose=verbose)
+    result = await ask(question, verbose=verbose, principal=principal)
     elapsed = time.monotonic() - started
 
     print("=" * 72)
