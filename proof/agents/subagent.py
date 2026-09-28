@@ -27,6 +27,7 @@ from proof.trace import record_usage, span
 from .budget import SessionBudget
 from .config import REQUEST_KWARGS, SUBAGENT_MODEL
 from .servers import ServerSpec
+from .timing import TimedSession, acting_as
 
 SUBAGENT_SYSTEM = """\
 You are the {domain} agent for a bakery manufacturing network.
@@ -67,6 +68,11 @@ class SubAgentResult:
     # Surfaced up so the eval can grade "was the unauthorised action refused"
     # without re-querying the denial log.
     authorization: str = "allowed"
+    # Which model actually served this delegation, and why (the router's
+    # decision). Recorded so a benchmark -- or a reviewer -- can see which
+    # tier produced each answer rather than assume.
+    model: str = ""
+    route: dict[str, Any] = field(default_factory=dict)
 
     def as_tool_result(self) -> str:
         """Rendered for the coordinator.
@@ -104,16 +110,25 @@ class SubAgentResult:
 async def run_subagent(spec: ServerSpec, session: ClientSession,
                        question: str, client: AsyncAnthropic,
                        budget: "SessionBudget | None" = None,
-                       streamer: Any = None) -> SubAgentResult:
+                       streamer: Any = None,
+                       model: str | None = None) -> SubAgentResult:
     """Run one domain sub-agent against its MCP server.
 
     A `delegate` span wraps the whole call and every turn's tokens roll up
     into it, so the trace answers "what did asking the inventory agent cost?"
     The shared budget is checked after each turn, so a sub-agent stuck in a
     loop trips the ceiling here rather than spinning to its max_iterations.
+
+    `model` is the router's pick for this delegation; None means the
+    configured SUBAGENT_MODEL, i.e. behaviour without a router.
     """
+    model = model or SUBAGENT_MODEL
+    agent = f"subagent:{spec.domain}"
     mcp_tools = (await session.list_tools()).tools
-    tools = [async_mcp_tool(t, session) for t in mcp_tools]
+    # TimedSession times each call_tool for the per-question breakdown;
+    # everything else passes straight through to the real session.
+    timed = TimedSession(session, agent)
+    tools = [async_mcp_tool(t, timed) for t in mcp_tools]
 
     calls: list[dict[str, Any]] = []
     final_text: list[str] = []
@@ -121,12 +136,12 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
     in_tok = out_tok = 0
 
     with span(f"delegate:{spec.domain}", "delegate",
-              domain=spec.domain, model=SUBAGENT_MODEL) as sp:
+              domain=spec.domain, model=model) as sp, acting_as(agent, model):
         runner = client.beta.messages.tool_runner(
             system=SUBAGENT_SYSTEM.format(domain=spec.domain, charter=spec.charter),
             messages=[{"role": "user", "content": question}],
             tools=tools,
-            model=SUBAGENT_MODEL,
+            model=model,
             # A sub-agent that needs more than this many round trips has
             # misunderstood its job; better to stop than to spin on the bill.
             max_iterations=8,
@@ -138,7 +153,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
             out_tok += message.usage.output_tokens
             if budget is not None:
                 budget.record(message.usage.input_tokens,
-                              message.usage.output_tokens)
+                              message.usage.output_tokens, model)
                 budget.check()  # raises BudgetExceeded; caught by coordinator
 
             text_blocks = [b.text.strip() for b in message.content
@@ -195,7 +210,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
             except (ValueError, TypeError):
                 continue
 
-        record_usage(sp, in_tok, out_tok)
+        record_usage(sp, in_tok, out_tok, model)
         sp.set_attribute("proof.tool_calls", len(calls))
         sp.set_attribute("proof.citation_status", citation_check.status)
 
@@ -209,6 +224,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
         citations_used=citation_check.cited,
         citations_fabricated=citation_check.fabricated,
         authorization=authorization,
+        model=model,
     )
 
 

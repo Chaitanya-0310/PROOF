@@ -21,7 +21,7 @@ COMPOSE = docker compose
 PY      = uv run python
 
 .PHONY: help up down reset logs psql shell install seed scenario verify
-.PHONY: smoke smoke-mcp smoke-rag smoke-authz index ask demo1 demo2 demo3
+.PHONY: smoke smoke-mcp smoke-cache bench-router smoke-rag smoke-authz index ask demo1 demo2 demo3
 .PHONY: pending approve reject smoke-trace eval-check eval
 .PHONY: baseline baseline-live
 
@@ -75,6 +75,14 @@ smoke: ## Phase 2 -- exercise every domain tool against the DB (no API key)
 
 smoke-mcp: ## Phase 2 -- start each MCP server and call it over stdio (no API key)
 	$(PY) scripts/smoke_mcp.py
+
+smoke-cache: ## Semantic cache -- identity + filter partitioning (no API key, no Redis)
+	$(PY) scripts/smoke_cache.py
+
+ARMS ?= off,light
+REPS ?= 2
+bench-router: ## Router benchmark, graded: make bench-router [ARMS=off,light,jev] [REPS=2] (needs key)
+	$(PY) scripts/bench_router.py --arms $(ARMS) --reps $(REPS)
 
 # --- Phase 3 -------------------------------------------------------------
 

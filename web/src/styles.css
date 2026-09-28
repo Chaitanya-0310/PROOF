@@ -1398,3 +1398,81 @@ button.btn:disabled {
   border-radius: 12px !important;
 }
 
+
+/* ─── Rendered markdown (coordinator answers) ─── */
+.md.answer,
+.md.chat-msg-text { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; }
+.md strong { font-weight: 650; color: var(--ink); }
+.md h1, .md h2, .md h3, .md h4 {
+  margin: 18px 0 8px;
+  line-height: 1.3;
+  color: var(--ink);
+}
+.md h1 { font-size: 17px; }
+.md h2 { font-size: 15.5px; }
+.md h3 {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.md h4 { font-size: 13.5px; }
+.md ul, .md ol { margin: 0 0 12px; padding-left: 20px; }
+.md li { margin: 3px 0; }
+.md li > ul, .md li > ol { margin: 4px 0 2px; }
+.md li::marker { color: var(--ink-3); }
+.md code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.md pre {
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+.md pre code { background: none; border: 0; padding: 0; }
+.md blockquote {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--fgf-orange);
+  background: var(--fgf-orange-glow);
+  border-radius: 0 6px 6px 0;
+}
+.md blockquote p:last-child { margin-bottom: 0; }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+.md a { color: var(--fgf-orange); }
+.md-table-wrap { overflow-x: auto; margin: 0 0 12px; }
+.md table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.md th, .md td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.md th {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--surface-2);
+  border-bottom-color: var(--line-strong);
+}
+.md tbody tr:hover { background: var(--surface-2); }

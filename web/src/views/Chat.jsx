@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
 import { api } from "../api.js";
+import Markdown from "../components/Markdown.jsx";
 
 const fmt = (n) => (typeof n === "number" ? n.toLocaleString() : n);
 
@@ -212,6 +213,11 @@ export default function Chat({ principalKey }) {
   const [busy, setBusy] = useState(false);
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
+  // The identity the pending-actions effect last ran for. Decides "greeting"
+  // vs "identity changed" -- message count cannot, because StrictMode runs
+  // the effect twice on mount and the second run would see the first's
+  // greeting and announce an identity change that never happened.
+  const lastPrincipalRef = useRef(null);
 
   // Scroll to bottom on new messages
   const scrollToBottom = useCallback(() => {
@@ -227,17 +233,28 @@ export default function Chat({ principalKey }) {
 
   // On mount: greet + load pending actions as inline HITL cards
   useEffect(() => {
+    // Ignore a response that arrives after this effect was torn down --
+    // StrictMode's discarded first run, or an identity switched mid-request.
+    // Without this, both runs append and the transcript gets duplicates.
+    let cancelled = false;
+    const identityChanged =
+      lastPrincipalRef.current !== null && lastPrincipalRef.current !== principalKey;
+    lastPrincipalRef.current = principalKey;
+
     api.pending().then((d) => {
+      if (cancelled) return;
       const pending = d.rows || [];
-      
+
       setMessages(prev => {
         const msgs = [...prev];
-        if (msgs.length === 0) {
-          msgs.push({
-            id: nextId(),
-            role: "system",
-            text: "PROOF is online. Ask me anything about the plant — or review the pending actions below.",
-          });
+        if (!identityChanged) {
+          if (msgs.length === 0) {
+            msgs.push({
+              id: nextId(),
+              role: "system",
+              text: "PROOF is online. Ask me anything about the plant — or review the pending actions below.",
+            });
+          }
         } else {
           msgs.push({
             id: nextId(),
@@ -260,12 +277,14 @@ export default function Chat({ principalKey }) {
       });
       scrollToBottom();
     }).catch(() => {
+      if (cancelled) return;
       setMessages(prev => prev.length === 0 ? [{
         id: nextId(),
         role: "system",
         text: "PROOF is online. Ask me anything about the plant — or review the pending actions below.",
       }] : prev);
     });
+    return () => { cancelled = true; };
   }, [principalKey, scrollToBottom]);
 
   // Submit a question
@@ -389,6 +408,10 @@ export default function Chat({ principalKey }) {
   }
 
   const enabled = status?.model_configured;
+  // Suggestions are for starting a conversation, so they stay until the
+  // operator has asked something. Greeting, identity notices and pending
+  // action cards are not questions and must not hide them.
+  const hasAsked = messages.some((m) => m.role === "user");
 
   return (
     <div className="chat-container">
@@ -431,9 +454,9 @@ export default function Chat({ principalKey }) {
                   <div className="chat-msg-avatar chat-avatar-agent">P</div>
                   <div className="chat-msg-body">
                     <div className="chat-msg-sender">PROOF</div>
-                    <div className="chat-msg-text chat-msg-text-agent">
+                    <Markdown className="chat-msg-text chat-msg-text-agent">
                       {m.text}
-                    </div>
+                    </Markdown>
                     {m.meta && (
                       <>
                         <ToolCallSection delegations={m.meta.delegations} />
@@ -518,7 +541,7 @@ export default function Chat({ principalKey }) {
       {/* Sticky composer at bottom */}
       <div className="chat-composer-wrap">
         <div className="chat-composer">
-          {messages.length <= 1 && (
+          {!hasAsked && (
             <div className="chip-row" style={{ marginTop: 0, marginBottom: 10 }}>
               {EXAMPLES.map((ex, i) => (
                 <button

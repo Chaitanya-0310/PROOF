@@ -42,16 +42,21 @@ class SessionBudget:
     input_tokens: int = 0
     output_tokens: int = 0
     _tripped: str | None = field(default=None)
+    # Accumulated per call, priced at the model that served THAT call. With
+    # a router in play the coordinator and each sub-agent may run on
+    # different models, so pricing the token total at one rate is wrong.
+    _cost_usd: float = 0.0
 
     @property
     def cost_usd(self) -> float:
-        return estimate_cost(self.input_tokens, self.output_tokens)
+        return self._cost_usd
 
     @property
     def tripped(self) -> str | None:
         return self._tripped
 
-    def record(self, input_tokens: int, output_tokens: int) -> None:
+    def record(self, input_tokens: int, output_tokens: int,
+               model: str | None = None) -> None:
         """Count one model call. Call AFTER each turn, before the next.
 
         Recording happens even on the call that trips the budget -- the tokens
@@ -60,6 +65,15 @@ class SessionBudget:
         self.model_calls += 1
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+        self._cost_usd += estimate_cost(input_tokens, output_tokens, model)
+
+    def add_cost(self, usd: float) -> None:
+        """Spend that is not a model turn -- e.g. a routing decision.
+
+        Counted against the dollar ceiling (a router that loops is still a
+        runaway) but not against the model-call ceiling.
+        """
+        self._cost_usd += usd
 
     def check(self) -> None:
         """Raise if either ceiling is now exceeded.

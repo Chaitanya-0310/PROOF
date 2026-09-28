@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
+import Markdown from "../components/Markdown.jsx";
 
 const EXAMPLES = [
   "Line 3 at TOR1 just went down, sheeter failure, maintenance says 90 minutes. What's at risk and what should I do?",
@@ -114,7 +115,7 @@ export default function Ask({ principalKey }) {
       {answer && (
         <>
           <div className="card" style={{ borderLeft: "3px solid var(--fgf-orange)" }}>
-            <div className="answer">{answer.answer}</div>
+            <Markdown className="answer">{answer.answer}</Markdown>
           </div>
 
           {answer.delegations?.length > 0 && (

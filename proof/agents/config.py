@@ -61,6 +61,34 @@ USD_PER_MTOK_IN = float(os.getenv("PROOF_USD_PER_MTOK_IN") or 5.00)
 USD_PER_MTOK_OUT = float(os.getenv("PROOF_USD_PER_MTOK_OUT") or 25.00)
 
 
-def estimate_cost(input_tokens: int, output_tokens: int) -> float:
-    return (input_tokens / 1_000_000 * USD_PER_MTOK_IN
-            + output_tokens / 1_000_000 * USD_PER_MTOK_OUT)
+# Per-model rates, for when a router mixes models in one question. One global
+# rate is fine while every call uses the same model; the moment a router sends
+# some turns elsewhere it makes every cost line wrong in a way that looks
+# plausible. JSON: {"model-id": [usd_per_mtok_in, usd_per_mtok_out], ...}.
+# A model missing from the table falls back to the global rate above, and
+# `price_known()` lets a report say so rather than print a confident guess.
+def _parse_model_prices() -> dict[str, tuple[float, float]]:
+    import json
+
+    raw = os.getenv("PROOF_MODEL_PRICES") or ""
+    if not raw.strip():
+        return {}
+    try:
+        return {k: (float(v[0]), float(v[1])) for k, v in json.loads(raw).items()}
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return {}
+
+
+MODEL_PRICES: dict[str, tuple[float, float]] = _parse_model_prices()
+
+
+def price_known(model: str | None) -> bool:
+    return model is None or model in MODEL_PRICES or model in (
+        COORDINATOR_MODEL, SUBAGENT_MODEL)
+
+
+def estimate_cost(input_tokens: int, output_tokens: int,
+                  model: str | None = None) -> float:
+    rate_in, rate_out = MODEL_PRICES.get(model or "", (USD_PER_MTOK_IN, USD_PER_MTOK_OUT))
+    return (input_tokens / 1_000_000 * rate_in
+            + output_tokens / 1_000_000 * rate_out)

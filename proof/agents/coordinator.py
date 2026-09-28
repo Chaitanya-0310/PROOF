@@ -22,7 +22,9 @@ coordinator is told explicitly not to fan out when one domain will do.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,9 +38,11 @@ from proof.identity import Principal, resolve
 from proof.trace import record_usage, span
 
 from .budget import BudgetExceeded, SessionBudget
-from .config import COORDINATOR_MODEL, REQUEST_KWARGS, estimate_cost
+from .config import COORDINATOR_MODEL, REQUEST_KWARGS, SUBAGENT_MODEL, estimate_cost
+from .router import route
 from .servers import ROOT, SERVERS, ServerSpec
 from .subagent import SubAgentResult, run_subagent
+from .timing import Timeline, acting_as, timed_http_client, timeline_scope
 
 COORDINATOR_SYSTEM = """\
 You are PROOF, the operations coordinator for a bakery manufacturing network
@@ -81,6 +85,40 @@ ANSWERING
 - Finish with a short "Evidence" section listing the tools that were called.
   Numbers a plant manager cannot audit are numbers they will not act on.
 
+FORMAT
+
+Your answer is rendered as GitHub-flavoured markdown. Use this shape, and
+drop any section that has nothing in it:
+
+  **<One-sentence headline: the decision or the number that matters.>**
+
+  ### Situation
+  2-4 short bullets: what happened, the key figures, the key times.
+
+  ### Impact
+  Use a markdown table for any list of 3+ items that share the same fields
+  (runs, orders, lots, lines). Put units in the column header, e.g.
+  | Time (UTC) | Line | SKU | Product | Units | Flour needed (kg) |
+  Keep each cell short. Show at most ~8 rows, then one line saying how many
+  more there are and over what time window.
+
+  ### Recommended action
+  Numbered steps, each with its tradeoff and who has to approve it.
+
+  ### Not determined
+  Bullets for the gaps, one line each.
+
+  ### Evidence
+  One bullet per tool: `tool_name` -- what it provided.
+
+Style rules:
+- Bold only the headline and at most two or three critical figures. Do not
+  bold every number.
+- Write timestamps as `2026-03-17 14:39 UTC` and put thousands separators in
+  large numbers.
+- No nested bullets deeper than one level. No headings above ###.
+- Keep it scannable: short sentences, no paragraph longer than three lines.
+
 WHO YOU ARE ACTING FOR
 
 {who}
@@ -110,6 +148,11 @@ class CoordinatorResult:
     input_tokens: int = 0
     output_tokens: int = 0
     budget: SessionBudget | None = None
+    # Where the time went (proof.agents.timing report), which model the
+    # coordinator ran on, and the router's reason for picking it.
+    timing: dict[str, Any] = field(default_factory=dict)
+    model: str = ""
+    route: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_input(self) -> int:
@@ -121,6 +164,11 @@ class CoordinatorResult:
 
     @property
     def cost_usd(self) -> float:
+        # The budget prices each call at the model that served it (and
+        # includes routing spend). The token-total fallback is only right
+        # when a single model served everything.
+        if self.budget is not None:
+            return self.budget.cost_usd
         return estimate_cost(self.total_input, self.total_output)
 
 
@@ -148,25 +196,47 @@ async def ask(question: str, *, verbose: bool = False,
               streamer: Any = None) -> CoordinatorResult:
     """Answer an operations question by planning across the five domains."""
     principal = principal or resolve()
-    client = AsyncAnthropic()
+    # Every model call goes through this client, so its httpx hooks see (and
+    # time) every one of them -- coordinator and sub-agents alike.
+    client = AsyncAnthropic(http_client=timed_http_client())
     collected: list[SubAgentResult] = []
     # One budget for the whole question, shared with every sub-agent. This is
     # what catches a coordinator that re-delegates in a loop -- each agent can
     # stay under its own max_iterations while the total runs away.
     budget = SessionBudget()
+    timeline = Timeline()
 
     async with AsyncExitStack() as stack:
+        # First on the stack, so it is the last thing reset: the timeline is
+        # visible to every task spawned below, including MCP shutdown.
+        stack.enter_context(timeline_scope(timeline))
+        stack.push_async_callback(client.close)
         # span() is a sync context manager, so it cannot sit in the `async
         # with` itself. Entered first on the stack, it closes last -- after
         # every MCP session below has shut down.
         session_span = stack.enter_context(span(
             "session", "session", principal=principal.principal_id,
             model=COORDINATOR_MODEL))
+
+        # The coordinator's routing decision needs only the question, so it
+        # runs WHILE the MCP servers spawn. Startup takes seconds and a Jev
+        # decision well under one, so on this path routing costs the user no
+        # wall time at all.
+        coord_route_task = asyncio.create_task(
+            route("coordinator", COORDINATOR_MODEL, question))
+
         # All five servers come up before the coordinator plans. Lazy-starting
         # them per delegation would put subprocess spawn latency inside the
         # agent loop, where it is indistinguishable from the model thinking.
-        sessions = {name: await _open_session(stack, spec, principal)
-                    for name, spec in SERVERS.items()}
+        with timeline.measure("startup", "mcp spawn x5", agent="session"):
+            sessions = {name: await _open_session(stack, spec, principal)
+                        for name, spec in SERVERS.items()}
+
+        coord_route = await coord_route_task
+        coord_model = coord_route.model
+        budget.add_cost(coord_route.cost_usd)
+        session_span.set_attribute("proof.model", coord_model)
+        session_span.set_attribute("proof.route", coord_route.reason)
 
         def make_delegate(domain: str):
             spec = SERVERS[domain]
@@ -178,8 +248,14 @@ async def ask(question: str, *, verbose: bool = False,
                 if streamer:
                     await streamer.emit("delegate_start", {"domain": domain, "question": delegate_question})
                 
-                from proof.agents.cache import get_cached_quality_response, set_cached_quality_response
-                cached_result = get_cached_quality_response(domain, question)
+                from proof.agents.cache import (get_cached_subagent_response,
+                                                set_cached_subagent_response)
+                # Keyed on the DELEGATE question (not the coordinator's
+                # top-level one) and the resolved principal. Two sub-questions
+                # to the same domain in one turn are distinct entries, and one
+                # principal's result is never served to another.
+                cached_result = get_cached_subagent_response(
+                    principal, domain, delegate_question)
                 if cached_result:
                     cached_result.answer = f"[Semantic Cache Hit]\n{cached_result.answer}"
                     collected.append(cached_result)
@@ -188,11 +264,24 @@ async def ask(question: str, *, verbose: bool = False,
                               f"{len(cached_result.tool_calls)} tool call(s)", file=sys.stderr)
                     return cached_result.as_tool_result()
 
+                # Routed AFTER the cache check: a cache hit needs no model, so
+                # it should not pay for a routing decision either.
+                decision = await route("subagent", SUBAGENT_MODEL,
+                                       delegate_question, domain=domain,
+                                       charter=spec.charter)
+                budget.add_cost(decision.cost_usd)
+                if verbose:
+                    print(f"     route: {decision.model} ({decision.reason})",
+                          file=sys.stderr)
+
                 result = await run_subagent(
-                    spec, sessions[domain], delegate_question, client, budget, streamer)
-                
-                set_cached_quality_response(domain, question, result)
-                    
+                    spec, sessions[domain], delegate_question, client, budget,
+                    streamer, model=decision.model)
+                result.route = decision.as_dict()
+
+                set_cached_subagent_response(
+                    principal, domain, delegate_question, result)
+
                 collected.append(result)
                 if verbose:
                     print(f"  <- {domain} agent: "
@@ -223,11 +312,16 @@ async def ask(question: str, *, verbose: bool = False,
                f"{principal.role.replace('_', ' ')}, scoped to {scope}.\n"
                f"Capabilities: {', '.join(sorted(principal.capabilities))}.")
 
+        # Model calls made from here on are the coordinator's own, except
+        # inside a delegation, which re-attributes to its sub-agent and
+        # restores this on the way out.
+        stack.enter_context(acting_as("coordinator", coord_model))
+
         runner = client.beta.messages.tool_runner(
             system=COORDINATOR_SYSTEM.format(roster=roster, who=who),
             messages=[{"role": "user", "content": question}],
             tools=tools,
-            model=COORDINATOR_MODEL,
+            model=coord_model,
             # Each iteration may fan out to several sub-agents, so this is a
             # ceiling on planning rounds, not on total work.
             max_iterations=10,
@@ -241,7 +335,7 @@ async def ask(question: str, *, verbose: bool = False,
                 in_tok += message.usage.input_tokens
                 out_tok += message.usage.output_tokens
                 budget.record(message.usage.input_tokens,
-                              message.usage.output_tokens)
+                              message.usage.output_tokens, coord_model)
                 budget.check()  # coordinator's own turns count too
 
                 # A refusal returns HTTP 200 with empty content. Surfacing it
@@ -275,11 +369,20 @@ async def ask(question: str, *, verbose: bool = False,
                 f"\n[stopped by the session budget: {exc}. This answer is "
                 f"partial. Re-ask with a narrower question.]")
 
-        record_usage(session_span, in_tok, out_tok)
+        record_usage(session_span, in_tok, out_tok, coord_model)
         session_span.set_attribute("proof.model_calls", budget.model_calls)
         session_span.set_attribute("proof.delegations", len(collected))
         if budget.tripped:
             session_span.set_attribute("proof.budget_tripped", budget.tripped)
+        # The answer exists from here; what follows is MCP shutdown.
+        t_answer = time.perf_counter()
+
+    # Shutdown is real wall time for a CLI user but not part of producing the
+    # answer, so it is recorded separately rather than folded into "other".
+    timeline.add("teardown", "session", "mcp shutdown", t_answer, time.perf_counter())
+    timeline.finish()
+    timing = timeline.report()
+    timing["time_to_answer_s"] = round(t_answer - timeline.t0, 3)
 
     return CoordinatorResult(
         answer="\n".join(final_text) or "(no answer produced)",
@@ -287,4 +390,7 @@ async def ask(question: str, *, verbose: bool = False,
         input_tokens=in_tok,
         output_tokens=out_tok,
         budget=budget,
+        timing=timing,
+        model=coord_model,
+        route=coord_route.as_dict(),
     )

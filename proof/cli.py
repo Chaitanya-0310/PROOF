@@ -75,12 +75,21 @@ async def run(question: str, verbose: bool, principal_id: str | None) -> int:
     print("=" * 72)
 
     print(f"\ndelegation trace ({len(result.subagent_results)} sub-agent call(s))")
+    print(f"  {'coordinator':11s} model {result.model}"
+          + (f"  [{result.route.get('reason')}]" if result.route.get("mode") != "off" else ""))
     for r in result.subagent_results:
         print(f"  {r.domain:11s} {len(r.tool_calls)} tool call(s): "
               + ", ".join(c["tool"] for c in r.tool_calls))
+        if r.model:
+            print(f"  {'':11s} model {r.model}"
+                  + (f"  [{r.route.get('reason')}]"
+                     if r.route and r.route.get("mode") != "off" else ""))
 
     print(f"\n{result.total_input:,} in / {result.total_output:,} out tokens "
-          f"~ ${result.cost_usd:.3f}   {elapsed:.1f}s")
+          f"~ ${result.cost_usd:.4f}   {elapsed:.1f}s")
+    if result.timing:
+        from proof.agents.timing import format_report
+        print("\n" + format_report(result.timing))
     return 0
 
 

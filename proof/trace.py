@@ -170,14 +170,20 @@ def span(name: str, kind: str, **attrs: Any):
         yield sp
 
 
-def record_usage(sp, input_tokens: int, output_tokens: int) -> float:
+def record_usage(sp, input_tokens: int, output_tokens: int,
+                 model: str | None = None, cost_usd: float | None = None) -> float:
     """Attach token counts and a dollar estimate to a span; return the cost.
 
     Cost lives on the span, not just in a summary line, so a trace answers
     'what did this one delegation cost?' -- which is the question that starts
     the runaway-cost investigation the Phase 5 write-up is about.
+
+    `cost_usd`, when given, is used as-is: a span covering calls to several
+    models (the session, under a router) cannot be priced from its token
+    total at a single rate.
     """
-    cost = estimate_cost(input_tokens, output_tokens)
+    cost = (cost_usd if cost_usd is not None
+            else estimate_cost(input_tokens, output_tokens, model))
     sp.set_attribute("proof.input_tokens", input_tokens)
     sp.set_attribute("proof.output_tokens", output_tokens)
     sp.set_attribute("proof.cost_usd", round(cost, 6))

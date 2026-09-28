@@ -66,12 +66,13 @@ make scenario  # plant the three reproducible demo situations
 make verify    # sanity-check the dataset
 ```
 
-**Docker runs Postgres only.** Application code runs on the host under `uv`.
-Rebuilding an image on every dependency change, and paying Windows bind-mount
-latency on every edit, costs more than it buys when the only thing that genuinely
-needs isolating is the database. An `app` service remains in `docker-compose.yml`
-as a no-install fallback:
-`docker compose exec -T app python seed/generate_plant.py`.
+**Docker runs the stateful services — Postgres and Redis** (the latter backs
+the semantic cache). Application code runs on the host under `uv`. Rebuilding an
+image on every dependency change, and paying Windows bind-mount latency on every
+edit, costs more than it buys when the only things that genuinely need isolating
+are the datastores. An `app` service remains in `docker-compose.yml` as a
+no-install fallback: `docker compose exec -T app python seed/generate_plant.py`.
+The cache also fails open, so a question is still answered if Redis is down.
 
 ---
 
@@ -717,7 +718,7 @@ boundary sits entirely below the view layer.
 ### Recent Architecture & UX Improvements
 To make the application robust and production-ready, several significant UX and performance upgrades have been implemented. See [`SYSTEM_IMPROVEMENTS.md`](SYSTEM_IMPROVEMENTS.md) for full details:
 - **Real-Time SSE Streaming:** The backend streams `delegate_start`, `tool_call`, and `final` events live, eliminating spinner fatigue and offering a dynamic, ChatGPT-style interface.
-- **Exact-Match Semantic Caching:** A Redis-backed query hash intercepts repeat questions instantly ($0 cost, near-zero latency) while securely preventing fuzzy-match false positives between similar plant names (e.g., TOR1 vs TOR2).
+- **Intent-Partitioned Semantic Caching:** A Redis-backed cache intercepts repeat and rephrased questions instantly ($0 cost, near-zero latency). It extracts the *hard filters* from a sub-question (plant, line, run, PO/SO/SKU, thresholds, product category) plus the acting principal into an exact-match partition, and runs semantic similarity only *within* a partition — so "scrap on line 3" and "scrap on line 5" (or the same question from a different operator) can never collide, while paraphrasing is still forgiven. It fails open, carries a TTL, and never caches a denial. Pinned by `make smoke-cache` (no API key, no Redis needed).
 - **Explicit Agent Reasoning:** Mock models are forced to emit a textual explanation before generating JSON tool calls, giving human operators full transparency into *why* an action is being proposed.
 - **UI State Preservation:** Switching identity roles in the UI preserves the chat history while loading the new role's pending actions, enabling seamless approval workflows.
 - **Exception Unwrapping:** Deep `asyncio.TaskGroup` tracebacks are parsed into clean, single-line actionable alerts for the frontend.
