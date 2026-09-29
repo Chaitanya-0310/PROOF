@@ -22,7 +22,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .config import estimate_cost
+from .config import estimate_cost, price_known
+
+
+def billed_cost(message) -> float | None:
+    """The provider's charge for one response, if it reported one.
+
+    OpenRouter adds `cost` to the usage block; the Claude API and most
+    gateways do not, and then this is None and the rate table prices the call.
+    """
+    cost = getattr(message.usage, "cost", None)
+    try:
+        return float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 class BudgetExceeded(RuntimeError):
@@ -46,6 +59,9 @@ class SessionBudget:
     # a router in play the coordinator and each sub-agent may run on
     # different models, so pricing the token total at one rate is wrong.
     _cost_usd: float = 0.0
+    # Calls priced from neither the provider's bill nor a known rate -- their
+    # cost is a default-rate guess. Zero means the total is trustworthy.
+    unpriced_calls: int = 0
 
     @property
     def cost_usd(self) -> float:
@@ -56,15 +72,25 @@ class SessionBudget:
         return self._tripped
 
     def record(self, input_tokens: int, output_tokens: int,
-               model: str | None = None) -> None:
+               model: str | None = None, billed_usd: float | None = None) -> None:
         """Count one model call. Call AFTER each turn, before the next.
 
         Recording happens even on the call that trips the budget -- the tokens
         were really spent, so they belong in the total the user is shown.
+
+        `billed_usd` is the provider's own charge for the call (OpenRouter
+        returns it as usage.cost). When present it wins over the rate table:
+        it is what was actually paid, and it prices calls whose model the
+        table has never heard of.
         """
         self.model_calls += 1
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+        if billed_usd is not None:
+            self._cost_usd += billed_usd
+            return
+        if not price_known(model):
+            self.unpriced_calls += 1
         self._cost_usd += estimate_cost(input_tokens, output_tokens, model)
 
     def add_cost(self, usd: float) -> None:

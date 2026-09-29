@@ -43,12 +43,20 @@ REQUEST_KWARGS: dict = {
     "fallbacks": "default",
 }
 
+_CLAUDE_ONLY = ("thinking", "betas", "fallbacks")
+
 if BASE_URL:
     # Adaptive thinking, the fallback beta and `fallbacks` are Claude API
     # features. A compatible gateway may reject them outright, so they are
     # dropped rather than risk every request failing on an unknown field.
-    for _key in ("thinking", "betas", "fallbacks"):
+    for _key in _CLAUDE_ONLY:
         REQUEST_KWARGS.pop(_key)
+
+# The coordinator under PROOF_ROUTER=jev-router talks to OpenRouter whatever
+# BASE_URL says, and Jev chooses the reasoning effort itself -- so the same
+# Claude-only fields are withheld there too.
+OPENROUTER_REQUEST_KWARGS: dict = {k: v for k, v in REQUEST_KWARGS.items()
+                                   if k not in _CLAUDE_ONLY}
 
 # Rough per-million-token rates for Claude Opus 5, used only for the local
 # cost line the CLI prints. Phase 5 replaces this with real per-span
