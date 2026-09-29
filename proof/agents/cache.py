@@ -73,6 +73,12 @@ MAX_ENTRIES_PER_PARTITION = int(os.getenv("PROOF_CACHE_MAX_ENTRIES") or 32)
 # eval run) without touching the call sites.
 ENABLED = (os.getenv("PROOF_CACHE_ENABLED") or "1").lower() not in ("0", "false", "no")
 
+# Domains that are never cached. The actions agent is the only write path: a
+# cache hit there replays "queued as action 1" without queuing anything, so
+# the operator is told an approval is waiting when none exists. Its reads
+# (pending list, whoami) are live queue state and must not be stale either.
+UNCACHED_DOMAINS = frozenset({"actions"})
+
 _KEY_PREFIX = "agent_cache:v2"
 
 
@@ -211,6 +217,10 @@ def _cacheable(result: SubAgentResult) -> bool:
         return False
     if result.citation_status == "fabricated":
         return False
+    # The loop guard's stop notice (proof.agents.loopguard) is a transient
+    # model fault; caching it would replay the failure for the whole TTL.
+    if result.answer.lstrip().startswith("[stopped:"):
+        return False
     return True
 
 
@@ -219,7 +229,7 @@ def get_cached_subagent_response(principal: Principal, domain: str,
                                  question: str) -> SubAgentResult | None:
     """Return a cached sub-agent result for this exact state, if one is close
     enough in wording. None on any miss, disabled cache, or backend error."""
-    if not ENABLED:
+    if not ENABLED or domain in UNCACHED_DOMAINS:
         return None
     client = _client()
     if client is None:
@@ -261,7 +271,7 @@ def get_cached_subagent_response(principal: Principal, domain: str,
 def set_cached_subagent_response(principal: Principal, domain: str,
                                  question: str, result: SubAgentResult) -> None:
     """Store a sub-agent result in its state partition. No-op on any failure."""
-    if not ENABLED or not _cacheable(result):
+    if not ENABLED or domain in UNCACHED_DOMAINS or not _cacheable(result):
         return
     client = _client()
     if client is None:
