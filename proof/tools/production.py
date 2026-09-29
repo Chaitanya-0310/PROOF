@@ -18,14 +18,16 @@ def get_open_downtime(plant_code: str | None = None) -> dict:
     """
     return query(f"""
         SELECT p.plant_code, l.line_code, l.name AS line_name, d.event_id,
-               d.line_id, d.run_id, d.reason_code, d.reason_detail,
-               d.started_at,
+               d.line_id, d.run_id, k.sku_id, k.sku_code,
+               d.reason_code, d.reason_detail, d.started_at,
                round(EXTRACT(EPOCH FROM ({NOW} - d.started_at)) / 60)::int
                    AS minutes_down_so_far,
                d.eta_minutes AS operator_eta_minutes
         FROM ops.downtime_events d
         JOIN ops.lines l  ON l.line_id = d.line_id
         JOIN ops.plants p ON p.plant_id = l.plant_id
+        LEFT JOIN ops.production_runs r ON r.run_id = d.run_id
+        LEFT JOIN ops.skus k            ON k.sku_id = r.sku_id
         WHERE d.ended_at IS NULL
           AND (%s::text IS NULL OR p.plant_code = %s)
         ORDER BY d.started_at
@@ -36,7 +38,7 @@ def get_line_status(line_id: int) -> dict:
     """What a line is running now: SKU, rate, planned vs actual, schedule."""
     return query(f"""
         SELECT p.plant_code, l.line_code, l.name AS line_name, l.line_type,
-               r.run_id, k.sku_code, k.name AS sku_name, k.category,
+               r.run_id, k.sku_id, k.sku_code, k.name AS sku_name, k.category,
                k.allergens, k.proof_window_minutes,
                c.units_per_hour AS line_rate_units_per_hour,
                r.planned_units, r.actual_units, r.status,
@@ -81,15 +83,24 @@ def estimate_output_loss(line_id: int, minutes_down: int) -> dict:
              "proofed product it is usually the larger number.")
 
 
-def find_alternate_lines(sku_id: int, plant_code: str) -> dict:
+def find_alternate_lines(sku_id: int | None, plant_code: str,
+                         sku_code: str | None = None) -> dict:
     """Lines in the same plant that could run this SKU, and what switching costs.
 
     `busy_until` is NULL when the line is genuinely free. Changeover minutes
     are real: proposing a move without them would understate the cost of the
     recommendation the agent is about to make.
+
+    Takes the SKU by id or by code. Id-only once left the agent holding
+    "FLA-002" from another domain with no tool to turn it into an id, so it
+    reported the move as unvalidated rather than checking it.
     """
+    if sku_id is None and not sku_code:
+        return {"rows": [], "row_count": 0, "sql": "",
+                "error": "pass sku_id or sku_code"}
     return query(f"""
-        SELECT p.plant_code, l.line_id, l.line_code, l.name AS line_name,
+        SELECT p.plant_code, k.sku_id, k.sku_code,
+               l.line_id, l.line_code, l.name AS line_name,
                c.units_per_hour AS line_rate_units_per_hour,
                c.changeover_minutes,
                r.run_id        AS currently_running_run,
@@ -98,15 +109,18 @@ def find_alternate_lines(sku_id: int, plant_code: str) -> dict:
                        WHERE d.line_id = l.line_id AND d.ended_at IS NULL)
                    AS is_currently_down
         FROM ops.line_sku_compat c
+        JOIN ops.skus k   ON k.sku_id = c.sku_id
         JOIN ops.lines l  ON l.line_id = c.line_id
         JOIN ops.plants p ON p.plant_id = l.plant_id
         LEFT JOIN ops.production_runs r
                ON r.line_id = l.line_id
               AND r.planned_start <= {NOW} AND r.planned_end > {NOW}
               AND r.status IN ('running', 'scheduled')
-        WHERE c.sku_id = %s AND p.plant_code = %s
+        WHERE (%s::int IS NULL OR c.sku_id = %s)
+          AND (%s::text IS NULL OR k.sku_code = %s)
+          AND p.plant_code = %s
         ORDER BY (r.run_id IS NULL) DESC, c.changeover_minutes
-    """, (sku_id, plant_code),
+    """, (sku_id, sku_id, sku_code, sku_code, plant_code),
         note="A line is available if currently_running_run IS NULL and "
              "is_currently_down is false. Any move costs changeover_minutes "
              "before the first good unit.")

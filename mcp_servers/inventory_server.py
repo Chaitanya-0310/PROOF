@@ -74,8 +74,11 @@ def get_open_purchase_orders(plant_code: str,
 def project_material_runout(plant_code: str, material_code: str) -> str:
     """Walk the forward schedule to find when a material runs out.
 
-    Returns a running balance per scheduled run. The first row where
-    balance_after_run goes negative is the run that cannot be built.
+    Returns a running balance per scheduled run until the next inbound PO
+    arrives. The first row with short=true is the run that cannot be built.
+    `summary` holds the totals -- runs_short, deficit_at_window_end, whether
+    the PO covers it, short_skus (with sku_id) and short_run_ids. Quote those
+    rather than counting rows, and pass them on for follow-up questions.
 
     Args:
         plant_code: Plant code, e.g. TOR1.

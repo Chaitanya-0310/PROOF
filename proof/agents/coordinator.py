@@ -23,6 +23,7 @@ coordinator is told explicitly not to fan out when one domain will do.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from contextlib import AsyncExitStack
@@ -30,17 +31,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from anthropic import AsyncAnthropic, beta_async_tool
+from anthropic import AsyncAnthropic, Omit, beta_async_tool
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from proof.identity import Principal, resolve
 from proof.trace import record_usage, span
 
-from .budget import BudgetExceeded, SessionBudget
-from .config import COORDINATOR_MODEL, REQUEST_KWARGS, SUBAGENT_MODEL, estimate_cost
-from .router import route
+from .budget import BudgetExceeded, SessionBudget, billed_cost
+from .config import (COORDINATOR_MODEL, OPENROUTER_REQUEST_KWARGS, REQUEST_KWARGS,
+                     SUBAGENT_MODEL, estimate_cost)
+from .router import OPENROUTER_ANTHROPIC_BASE, route
 from .servers import ROOT, SERVERS, ServerSpec
+from .loopguard import LoopGuard, required_args
 from .subagent import SubAgentResult, run_subagent
 from .timing import Timeline, acting_as, timed_http_client, timeline_scope
 
@@ -63,6 +66,24 @@ HOW TO WORK
    question.
 3. Pass along concrete identifiers (line_id, run_id, sku_id, plant_code) that
    earlier agents returned. Agents cannot see each other's answers.
+4. These questions DEPEND on another agent's numbers. Never ask them in the
+   same turn as the question that produces those numbers:
+   - Staged-dough expiry needs a restart estimate. Ask production for the
+     stoppage first (line_id, operator_eta_minutes), then ask inventory to
+     run the scrap clock with exactly those two values.
+   - Who a material shortage hurts needs the runs it breaks. Ask inventory
+     for the runout first, then pass its summary.short_run_ids to demand
+     (orders allocated to those runs) and short_skus' sku_id or sku_code to
+     production (alternate lines).
+   Questions that do not feed each other still go in parallel.
+5. Each agent's evidence carries the tool's `summary` and its first rows.
+   Take counts and totals from `summary`, never from how many rows you were
+   shown. Fill table cells from the rows; if a field is genuinely absent,
+   name it under "Not determined" instead of leaving dashes in the table.
+6. Attribute a customer order to a cause only through allocations: an order
+   is hit by a material shortage when it is allocated to a short run. Do
+   not headline an order that is short for a different reason (a stopped
+   line, an aborted run) as though the material caused it.
 
 THE RULE THAT MATTERS MOST
 
@@ -100,7 +121,9 @@ drop any section that has nothing in it:
   (runs, orders, lots, lines). Put units in the column header, e.g.
   | Time (UTC) | Line | SKU | Product | Units | Flour needed (kg) |
   Keep each cell short. Show at most ~8 rows, then one line saying how many
-  more there are and over what time window.
+  more there are and over what time window. Count the remainder in the same
+  unit as the table's rows (if rows are SKUs, say how many more SKUs), and
+  compute it as total minus what the table already covers.
 
   ### Recommended action
   Numbered steps, each with its tradeoff and who has to approve it.
@@ -131,7 +154,23 @@ as though it were true.
 ACTING
 
 You cannot change the plant. You may PROPOSE an action through the actions
-agent, which queues it for a named human to approve. After proposing:
+agent, which queues it for a named human to approve.
+
+If your first recommendation is one the actions agent can queue -- expedite
+a PO, reallocate a run, notify a customer, hold product -- propose it in
+this same answer. The operator approves it with one click; a recommendation
+they must re-ask for is a dead end. Give the actions agent every field the
+proposal needs in one message, or it will stop and ask:
+  - expedite: plant_code, po_code, supplier, material_code, requested_date
+  - reallocate: plant_code, run_id, from_line, to_line, units_at_risk,
+    changeover_minutes
+  - notify customer: plant_code, order_code, customer, shortfall_units,
+    revised_availability, a short draft message
+  - hold: plant_code, scope, reason
+plus a one-line rationale. Propose only what the evidence supports; if a
+field is unknown, say so under "Not determined" instead of proposing.
+
+After proposing:
 
 - Say it is AWAITING APPROVAL and name who must approve it.
 - Never call a queued action done, sent, scheduled or actioned.
@@ -139,6 +178,13 @@ agent, which queues it for a named human to approve. After proposing:
   refused and who could authorise it. Do not retry, and do not look for an
   equivalent action by another route.
 """
+
+
+STUCK_ANSWER = (
+    "**PROOF could not answer this time.** The agents stopped because {reason}. "
+    "This is a fault in the model's tool calls, not in the plant data -- "
+    "ask again. If it keeps happening, check the model gateway or switch "
+    "PROOF_COORDINATOR_MODEL / PROOF_SUBAGENT_MODEL.")
 
 
 @dataclass
@@ -153,6 +199,10 @@ class CoordinatorResult:
     timing: dict[str, Any] = field(default_factory=dict)
     model: str = ""
     route: dict[str, Any] = field(default_factory=dict)
+    # The model that actually served each coordinator turn, as the response
+    # reported it. Under jev-router `model` is the router's id and this is
+    # what Jev picked; otherwise it just repeats `model`.
+    coordinator_models: list[str] = field(default_factory=list)
 
     @property
     def total_input(self) -> int:
@@ -235,13 +285,32 @@ async def ask(question: str, *, verbose: bool = False,
         coord_route = await coord_route_task
         coord_model = coord_route.model
         budget.add_cost(coord_route.cost_usd)
+        # One OpenRouter client per question, opened on first use by whichever
+        # of the coordinator or a sub-agent is routed there.
+        openrouter: list[AsyncAnthropic] = []
+
+        def client_for(provider: str) -> tuple[AsyncAnthropic, dict]:
+            if provider != "openrouter":
+                return client, REQUEST_KWARGS
+            if not openrouter:
+                openrouter.append(_openrouter_client())
+                stack.push_async_callback(openrouter[0].close)
+            return openrouter[0], OPENROUTER_REQUEST_KWARGS
+
+        coord_client, coord_kwargs = client_for(coord_route.provider)
         session_span.set_attribute("proof.model", coord_model)
         session_span.set_attribute("proof.route", coord_route.reason)
 
         def make_delegate(domain: str):
             spec = SERVERS[domain]
 
-            async def delegate(delegate_question: str) -> str:
+            # The parameter is `question` so the schema matches the docstring's
+            # Args entry and carries its description. It was named
+            # `delegate_question` while the docstring said `question`, so the
+            # model saw an undocumented field -- and when a gateway sends the
+            # call with empty arguments, nothing in the schema helps it recover.
+            async def delegate(question: str) -> str:
+                delegate_question = question
                 if verbose:
                     print(f"  -> {domain} agent: {delegate_question}", file=sys.stderr)
                 
@@ -274,9 +343,10 @@ async def ask(question: str, *, verbose: bool = False,
                     print(f"     route: {decision.model} ({decision.reason})",
                           file=sys.stderr)
 
+                sub_client, sub_kwargs = client_for(decision.provider)
                 result = await run_subagent(
-                    spec, sessions[domain], delegate_question, client, budget,
-                    streamer, model=decision.model)
+                    spec, sessions[domain], delegate_question, sub_client, budget,
+                    streamer, model=decision.model, request_kwargs=sub_kwargs)
                 result.route = decision.as_dict()
 
                 set_cached_subagent_response(
@@ -300,6 +370,8 @@ async def ask(question: str, *, verbose: bool = False,
             return beta_async_tool(delegate)
 
         tools = [make_delegate(domain) for domain in SERVERS]
+        guard = LoopGuard(required_args(
+            {d["name"]: d["input_schema"] for d in (t.to_dict() for t in tools)}))
 
         roster = "\n".join(
             f"- ask_{name}_agent: {spec.charter}"
@@ -317,7 +389,7 @@ async def ask(question: str, *, verbose: bool = False,
         # restores this on the way out.
         stack.enter_context(acting_as("coordinator", coord_model))
 
-        runner = client.beta.messages.tool_runner(
+        runner = coord_client.beta.messages.tool_runner(
             system=COORDINATOR_SYSTEM.format(roster=roster, who=who),
             messages=[{"role": "user", "content": question}],
             tools=tools,
@@ -325,18 +397,34 @@ async def ask(question: str, *, verbose: bool = False,
             # Each iteration may fan out to several sub-agents, so this is a
             # ceiling on planning rounds, not on total work.
             max_iterations=10,
-            **REQUEST_KWARGS,
+            **coord_kwargs,
         )
 
         final_text: list[str] = []
+        served_by: list[str] = []
         in_tok = out_tok = 0
         try:
             async for message in runner:
                 in_tok += message.usage.input_tokens
                 out_tok += message.usage.output_tokens
+                # Priced at what the provider billed when it says (OpenRouter
+                # does), else at the model that served the turn: under
+                # jev-router that is Jev's pick, not the router id.
+                served = getattr(message, "model", None) or coord_model
+                served_by.append(served)
                 budget.record(message.usage.input_tokens,
-                              message.usage.output_tokens, coord_model)
+                              message.usage.output_tokens, served,
+                              billed_usd=billed_cost(message))
                 budget.check()  # coordinator's own turns count too
+
+                # Stop a loop that cannot make progress (empty or repeated
+                # delegations) now, with the reason, rather than after every
+                # remaining round and a bare "(no answer produced)".
+                stuck = guard.check(message)
+                if stuck:
+                    session_span.set_attribute("proof.stuck", stuck)
+                    final_text = [STUCK_ANSWER.format(reason=stuck)]
+                    break
 
                 # A refusal returns HTTP 200 with empty content. Surfacing it
                 # is the difference between "the model declined" and a blank
@@ -393,4 +481,20 @@ async def ask(question: str, *, verbose: bool = False,
         timing=timing,
         model=coord_model,
         route=coord_route.as_dict(),
+        coordinator_models=served_by,
+    )
+
+
+def _openrouter_client() -> AsyncAnthropic:
+    """An Anthropic-SDK client pointed at OpenRouter, for jev-router.
+
+    The SDK falls back to ANTHROPIC_API_KEY from the environment, which here
+    is the default gateway's key. Omitting X-Api-Key keeps that key from ever
+    being sent to OpenRouter; OpenRouter authenticates by Bearer token.
+    """
+    return AsyncAnthropic(
+        base_url=OPENROUTER_ANTHROPIC_BASE,
+        auth_token=os.environ["OPENROUTER_API_KEY"],
+        default_headers={"X-Api-Key": Omit()},
+        http_client=timed_http_client(),
     )

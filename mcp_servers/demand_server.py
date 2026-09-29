@@ -33,6 +33,19 @@ def get_orders_for_run(run_id: int) -> str:
 
 
 @server.tool()
+def get_orders_for_runs(run_ids: list[int]) -> str:
+    """Customer orders committed to any of several runs, one row per order.
+
+    Use for a material shortage: pass summary.short_run_ids from the
+    inventory runout to see exactly which orders the shortage hits.
+
+    Args:
+        run_ids: Numeric run ids.
+    """
+    return text_result(demand.get_orders_for_runs(run_ids))
+
+
+@server.tool()
 def get_at_risk_orders(plant_code: str, within_hours: int = 24) -> str:
     """Open orders shipping soon whose supplying line is stopped or behind.
 

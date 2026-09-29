@@ -60,17 +60,20 @@ def estimate_output_loss(line_id: int, minutes_down: int) -> str:
 
 
 @server.tool()
-def find_alternate_lines(sku_id: int, plant_code: str) -> str:
+def find_alternate_lines(plant_code: str, sku_id: int | None = None,
+                         sku_code: str | None = None) -> str:
     """Lines at a plant that could run this SKU, and the changeover cost.
 
     A line is genuinely available only when currently_running_run is null and
     is_currently_down is false.
 
     Args:
-        sku_id: Numeric SKU id.
         plant_code: Plant to search within, e.g. TOR1.
+        sku_id: Numeric SKU id. Pass this or sku_code.
+        sku_code: SKU code, e.g. FLA-002. Pass this or sku_id.
     """
-    return text_result(production.find_alternate_lines(sku_id, plant_code))
+    return text_result(
+        production.find_alternate_lines(sku_id, plant_code, sku_code))
 
 
 @server.tool()

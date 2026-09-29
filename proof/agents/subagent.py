@@ -24,7 +24,8 @@ from mcp import ClientSession
 from proof.rag.citations import check, citations_from_tool_results, enforce
 from proof.trace import record_usage, span
 
-from .budget import SessionBudget
+from .budget import SessionBudget, billed_cost
+from .loopguard import LoopGuard, required_args
 from .config import REQUEST_KWARGS, SUBAGENT_MODEL
 from .servers import ServerSpec
 from .timing import TimedSession, acting_as
@@ -44,6 +45,11 @@ Rules:
   convert units unless a tool did.
 - Be terse. You are reporting to a coordinator that will compose the final
   answer, not to a human. No preamble, no restating the question.
+- Each tool's `summary` and first rows are forwarded to the coordinator
+  automatically, so you need not restate them row by row. Do state totals
+  from `summary` when there is one; never present a row count as a total.
+- Name the identifiers a follow-up would need (line_id, run_id, sku_id,
+  sku_code, run_ids).
 - When a tool result includes a `note`, treat it as a binding caveat and
   reflect it in your answer.
 - You MUST briefly explain your reasoning in text before making any tool call.
@@ -104,14 +110,41 @@ class SubAgentResult:
                     # Say so rather than printing a bare "None". A missing
                     # audit trail is itself worth reporting upward.
                     lines.append(f"  (evidence unavailable: {c['evidence_error']})")
+                lines.extend(_data_lines(c))
         return "\n".join(lines)
+
+
+# How much of each tool result travels up verbatim. The sub-agent is told to
+# be terse, and it was: a 40-row runout came back as prose naming one run, so
+# the coordinator rendered an impact table of dashes and reported that the
+# data "was not returned". The rows were there; the summary dropped them.
+DATA_ROWS_UP = 20
+DATA_CELL_CHARS = 160
+
+
+def _data_lines(call: dict[str, Any]) -> list[str]:
+    """A tool's `summary` and its first rows, compact, for the coordinator."""
+    out: list[str] = []
+    if call.get("summary"):
+        out.append(f"  summary: {json.dumps(call['summary'], default=str)}")
+    rows = call.get("rows") or []
+    if rows:
+        shown = rows[:DATA_ROWS_UP]
+        out.append(f"  rows ({len(shown)} of {len(rows)}):")
+        for r in shown:
+            out.append("    " + json.dumps(
+                {k: (v[:DATA_CELL_CHARS] + "…"
+                     if isinstance(v, str) and len(v) > DATA_CELL_CHARS else v)
+                 for k, v in r.items()}, default=str))
+    return out
 
 
 async def run_subagent(spec: ServerSpec, session: ClientSession,
                        question: str, client: AsyncAnthropic,
                        budget: "SessionBudget | None" = None,
                        streamer: Any = None,
-                       model: str | None = None) -> SubAgentResult:
+                       model: str | None = None,
+                       request_kwargs: dict | None = None) -> SubAgentResult:
     """Run one domain sub-agent against its MCP server.
 
     A `delegate` span wraps the whole call and every turn's tokens roll up
@@ -121,14 +154,18 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
 
     `model` is the router's pick for this delegation; None means the
     configured SUBAGENT_MODEL, i.e. behaviour without a router.
+    `request_kwargs` overrides REQUEST_KWARGS when `client` is a different
+    provider (OpenRouter) that must not receive Claude-only fields.
     """
     model = model or SUBAGENT_MODEL
+    request_kwargs = REQUEST_KWARGS if request_kwargs is None else request_kwargs
     agent = f"subagent:{spec.domain}"
     mcp_tools = (await session.list_tools()).tools
     # TimedSession times each call_tool for the per-question breakdown;
     # everything else passes straight through to the real session.
     timed = TimedSession(session, agent)
     tools = [async_mcp_tool(t, timed) for t in mcp_tools]
+    guard = LoopGuard(required_args({t.name: t.input_schema for t in mcp_tools}))
 
     calls: list[dict[str, Any]] = []
     final_text: list[str] = []
@@ -145,7 +182,7 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
             # A sub-agent that needs more than this many round trips has
             # misunderstood its job; better to stop than to spin on the bill.
             max_iterations=8,
-            **REQUEST_KWARGS,
+            **request_kwargs,
         )
 
         async for message in runner:
@@ -153,8 +190,19 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
             out_tok += message.usage.output_tokens
             if budget is not None:
                 budget.record(message.usage.input_tokens,
-                              message.usage.output_tokens, model)
+                              message.usage.output_tokens,
+                              getattr(message, "model", None) or model,
+                              billed_usd=billed_cost(message))
                 budget.check()  # raises BudgetExceeded; caught by coordinator
+
+            # Break out before the runner executes this turn's calls: they
+            # would fail (or return) exactly as they did last turn.
+            stuck = guard.check(message)
+            if stuck:
+                sp.set_attribute("proof.stuck", stuck)
+                final_text = [f"[stopped: {stuck}. The {spec.domain} agent "
+                              f"has no reliable result for this question.]"]
+                break
 
             text_blocks = [b.text.strip() for b in message.content
                            if b.type == "text" and b.text.strip()]
@@ -276,6 +324,8 @@ async def _attach_turn_results(runner: Any,
             continue
         call["row_count"] = payload.get("row_count")
         call["sql"] = payload.get("sql")
+        call["rows"] = payload.get("rows")
+        call["summary"] = payload.get("summary")
 
     # Returned so the caller can run citation validation against the exact
     # rows retrieval produced, rather than against a re-query.
