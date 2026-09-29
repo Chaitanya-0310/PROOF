@@ -4,6 +4,35 @@ import Markdown from "../components/Markdown.jsx";
 
 const fmt = (n) => (typeof n === "number" ? n.toLocaleString() : n);
 
+// 7.4s · 1m 42s
+const fmtDuration = (s) => {
+  if (s == null || Number.isNaN(s)) return "";
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${String(Math.round(s - m * 60)).padStart(2, "0")}s`;
+};
+
+// Live elapsed time while the agents work. Ticks from the moment the question
+// was sent, so it matches the total shown on the finished answer.
+function ElapsedTimer({ startedAt }) {
+  const [now, setNow] = useState(() => performance.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(performance.now()), 100);
+    return () => clearInterval(id);
+  }, []);
+  return <span className="chat-elapsed">⏱ {fmtDuration((now - startedAt) / 1000)}</span>;
+}
+
+// Tooltip text: where the server says the time went.
+const timingTitle = (t) => {
+  if (!t || t.time_to_answer_s == null) return undefined;
+  const parts = [`Server: answer ready in ${fmtDuration(t.time_to_answer_s)}`];
+  if (t.startup_s != null) parts.push(`agent startup ${fmtDuration(t.startup_s)}`);
+  if (t.model_wall_s != null) parts.push(`model ${fmtDuration(t.model_wall_s)}`);
+  if (t.tools_wall_s != null) parts.push(`tools ${fmtDuration(t.tools_wall_s)}`);
+  return parts.join(" · ");
+};
+
 const EXAMPLES = [
   "Line 3 at TOR1 just went down, sheeter failure, maintenance says 90 minutes. What's at risk and what should I do?",
   "The flour delivery to TOR1 is running late. What does that break?",
@@ -298,9 +327,10 @@ export default function Chat({ principalKey }) {
     setMessages((prev) => [...prev, userMsg]);
     scrollToBottom();
 
-    // Add thinking indicator
+    // Add thinking indicator; the clock starts when the question is sent
     const thinkingId = nextId();
-    setMessages((prev) => [...prev, { id: thinkingId, role: "thinking", delegations: [] }]);
+    const startedAt = performance.now();
+    setMessages((prev) => [...prev, { id: thinkingId, role: "thinking", delegations: [], startedAt }]);
     scrollToBottom();
 
     setBusy(true);
@@ -340,35 +370,24 @@ export default function Chat({ principalKey }) {
             cost_usd: r.cost_usd,
             model_calls: r.model_calls,
             budget_tripped: r.budget_tripped,
+            // What the user waited, send to answer, plus the server's breakdown
+            elapsed_s: (performance.now() - startedAt) / 1000,
+            timing: r.timing,
           },
         };
         return [...without, agentMsg];
       });
 
-      // After agent replies, reload pending actions — new ones may have been proposed
+      // Cards for what this answer queued arrive WITH the answer, so the
+      // approval sits right under the text that says "AWAITING APPROVAL"
+      // instead of only turning up after a page reload.
+      appendActionCards(r.proposed_actions || []);
+
+      // Fallback: anything else now pending (e.g. queued from another
+      // session) that is not on screen yet. Deduped against the cards above.
       try {
         const pd = await api.pending();
-        const newActions = pd.rows || [];
-        if (newActions.length > 0) {
-          setMessages((prev) => {
-            // Find action IDs already in chat
-            const existingIds = new Set(
-              prev.filter((m) => m.role === "action").map((m) => m.action.action_id)
-            );
-            const fresh = newActions.filter((a) => !existingIds.has(a.action_id));
-            if (fresh.length === 0) return prev;
-
-            const newMsgs = [
-              {
-                id: nextId(),
-                role: "agent",
-                text: `I've proposed ${fresh.length} new action${fresh.length !== 1 ? "s" : ""}. Please review:`,
-              },
-              ...fresh.map((a) => ({ id: nextId(), role: "action", action: a })),
-            ];
-            return [...prev, ...newMsgs];
-          });
-        }
+        appendActionCards(pd.rows || []);
       } catch { /* actions reload failure is non-fatal */ }
 
     } catch (e) {
@@ -377,13 +396,33 @@ export default function Chat({ principalKey }) {
         const without = prev.filter((m) => m.id !== thinkingId);
         return [
           ...without,
-          { id: nextId(), role: "error", text: e.message },
+          { id: nextId(), role: "error", text: `${e.message} (after ${fmtDuration((performance.now() - startedAt) / 1000)})` },
         ];
       });
     } finally {
       setBusy(false);
       scrollToBottom();
     }
+  }
+
+  // Append approval cards for any of `actions` not already in the chat.
+  function appendActionCards(actions) {
+    setMessages((prev) => {
+      const onScreen = new Set(
+        prev.filter((m) => m.role === "action").map((m) => m.action.action_id)
+      );
+      const fresh = actions.filter((a) => !onScreen.has(a.action_id));
+      if (fresh.length === 0) return prev;
+      return [
+        ...prev,
+        {
+          id: nextId(),
+          role: "agent",
+          text: `I've proposed ${fresh.length} new action${fresh.length !== 1 ? "s" : ""}. Please review:`,
+        },
+        ...fresh.map((a) => ({ id: nextId(), role: "action", action: a })),
+      ];
+    });
   }
 
   function handleKeyDown(e) {
@@ -460,10 +499,15 @@ export default function Chat({ principalKey }) {
                     {m.meta && (
                       <>
                         <ToolCallSection delegations={m.meta.delegations} />
-                        {m.meta.cost_usd != null && (
+                        {(m.meta.cost_usd != null || m.meta.elapsed_s != null) && (
                           <div className="chat-msg-cost">
                             <span className="chat-cost-dot" />
-                            {m.meta.model_calls} model calls · ${m.meta.cost_usd}
+                            {m.meta.elapsed_s != null && (
+                              <span className="chat-runtime" title={timingTitle(m.meta.timing)}>
+                                ⏱ {fmtDuration(m.meta.elapsed_s)} total
+                              </span>
+                            )}
+                            {m.meta.cost_usd != null && <span>· {m.meta.model_calls} model calls · ${m.meta.cost_usd}</span>}
                             {m.meta.budget_tripped && (
                               <span className="pill danger" style={{ marginLeft: 8 }}>
                                 {m.meta.budget_tripped}
@@ -516,6 +560,7 @@ export default function Chat({ principalKey }) {
                       <span className="chat-thinking-dot" />
                       <span className="chat-thinking-dot" />
                       <span className="chat-thinking-dot" />
+                      {m.startedAt != null && <ElapsedTimer startedAt={m.startedAt} />}
                     </div>
                   </div>
                 </div>

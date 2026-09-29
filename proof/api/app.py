@@ -225,6 +225,41 @@ def ask_status() -> dict:
     }
 
 
+def _timing_summary(t: dict) -> dict:
+    """The few timing figures the console shows, from the coordinator's report."""
+    if not t:
+        return {}
+    return {
+        "time_to_answer_s": t.get("time_to_answer_s"),
+        "startup_s": t.get("startup_s"),
+        "model_wall_s": (t.get("model") or {}).get("wall_s"),
+        "tools_wall_s": (t.get("tools") or {}).get("wall_s"),
+    }
+
+
+def _proposed_this_turn(subagent_results: list) -> list[dict]:
+    """The approval cards for actions queued while answering this question.
+
+    Sent with the answer so the card renders beside the text that says
+    "AWAITING APPROVAL". Before, the chat only found new actions by re-polling
+    the pending list afterwards, so a card could be missing from the answer
+    and turn up later on a page reload. Read back from the queue rather than
+    trusted from the tool result, so the card shows what was actually stored.
+    """
+    from proof.tools import actions as action_tools
+
+    ids = {row["action_id"]
+           for r in subagent_results if r.domain == "actions"
+           for c in r.tool_calls
+           for row in (c.get("rows") or [])
+           if isinstance(row, dict) and row.get("action_id") is not None
+           and c["tool"].startswith("propose_")}
+    if not ids:
+        return []
+    return [a for a in action_tools.list_pending_actions()["rows"]
+            if a["action_id"] in ids]
+
+
 @app.post("/api/ask")
 async def ask_question(body: AskBody,
                        p: Principal = Depends(current_principal)):
@@ -254,6 +289,10 @@ async def ask_question(body: AskBody,
                 } for r in result.subagent_results],
                 "cost_usd": round(result.budget.cost_usd, 4) if result.budget else None,
                 "model_calls": result.budget.model_calls if result.budget else None,
+                # Server-side breakdown from proof.agents.timing, so the UI can
+                # show where a slow answer's time went, not just that it was slow.
+                "timing": _timing_summary(result.timing),
+                "proposed_actions": _proposed_this_turn(result.subagent_results),
             }
             await streamer.end(final_data)
         except Exception as e:
