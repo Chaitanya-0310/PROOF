@@ -9,6 +9,11 @@ and compares time, cost and graded quality side by side:
   light  always the light tier -- the CONTROL. If Jev beats `off` but not
          `light`, the win came from the cheaper model, not from routing.
   jev    Jev picks light or strong per decision (needs OPENROUTER_API_KEY)
+  jev-router
+         the coordinator runs on OpenRouter's typesafe/jev-router; sub-agents
+         stay fixed, so vs `off` this isolates the coordinator (needs the key)
+  openrouter-fixed
+         the control for jev-router: same provider, one fixed model, no Jev
 
 Method, and why:
 
@@ -31,6 +36,7 @@ a clean floor afterwards.
 Run:  make bench-router                       # off vs light, 2 reps
       make bench-router ARMS=off,light,jev REPS=3
       python scripts/bench_router.py --summarize data/bench/<file>.json
+      python scripts/bench_router.py --summarize base.json jev.json   # compare runs
 """
 from __future__ import annotations
 
@@ -86,13 +92,20 @@ async def run_one(arm: str, case: dict, timeout_s: float) -> dict:
             ask(case["question"], principal=principal_of(case["principal"])),
             timeout=timeout_s)
     except Exception as exc:  # noqa: BLE001 -- a failed run is a data point
+        # MCP/anyio wrap the real failure in ExceptionGroups; "unhandled
+        # errors in a TaskGroup" says nothing, so record the innermost one.
+        while getattr(exc, "exceptions", None):
+            exc = exc.exceptions[0]
         row.update(error=f"{type(exc).__name__}: {exc}",
                    wall_s=round(time.perf_counter() - t0, 3))
         return row
 
     t = result.timing
     sub_routes = [r.route for r in result.subagent_results if r.route]
-    models_used = [result.model] + [r.model for r in result.subagent_results if r.model]
+    # coordinator_models is what actually served each coordinator turn --
+    # under jev-router, Jev's picks rather than the router id.
+    models_used = ([result.model] + result.coordinator_models
+                   + [r.model for r in result.subagent_results if r.model])
     calls_by_model: dict[str, int] = {}
     for c in t["model"]["per_call"]:
         calls_by_model[c["model"]] = calls_by_model.get(c["model"], 0) + 1
@@ -119,9 +132,13 @@ async def run_one(arm: str, case: dict, timeout_s: float) -> dict:
         input_tokens=result.total_input,
         output_tokens=result.total_output,
         cost_usd=round(result.cost_usd, 6),
-        prices_known=all(price_known(m) for m in models_used),
+        # Trustworthy when every call was billed by the provider or priced
+        # from a known rate; the budget counts the ones that were neither.
+        prices_known=(result.budget.unpriced_calls == 0 if result.budget
+                      else all(price_known(m) for m in models_used)),
         coordinator_model=result.model,
         coordinator_route=result.route,
+        coordinator_models=result.coordinator_models,
         subagent_routes=[{"domain": r.domain, "model": r.model,
                           "tier": (r.route or {}).get("tier"),
                           "confidence": (r.route or {}).get("confidence"),
@@ -137,6 +154,10 @@ async def run_one(arm: str, case: dict, timeout_s: float) -> dict:
         must_pass=all(g.passed for g in grades if g.severity == "must"),
         should_failures=sum(1 for g in grades if not g.passed and g.severity == "should"),
         answer_chars=len(result.answer),
+        # False when the coordinator ended with no text at all -- e.g. it
+        # spent every iteration on tool calls the SDK rejected. The graders
+        # can still pass such a run on routing alone, so it is counted apart.
+        answered=result.answer != "(no answer produced)",
     )
     return row
 
@@ -171,6 +192,7 @@ def summarize(rows: list[dict]) -> str:
         return {
             "runs": len(rs), "ok": len(ok),
             "must_pass": sum(r["must_pass"] for r in ok),
+            "answered": sum(r.get("answered", True) for r in ok),
             "answer_p50": _med([r["answer_s"] for r in ok]),
             "answer_p90": _p([r["answer_s"] for r in ok], 0.9),
             "model_p50": _med([r["model_wall_s"] for r in ok]),
@@ -186,7 +208,7 @@ def summarize(rows: list[dict]) -> str:
     stats = {a: arm_stats(a) for a in arms}
 
     out.append("PER ARM  (medians across all runs; answer = time until the answer existed)")
-    out.append(f"{'arm':6s} {'runs':>4s} {'ok':>3s} {'must-pass':>9s} "
+    out.append(f"{'arm':10s} {'runs':>4s} {'ok':>3s} {'answered':>8s} {'must-pass':>9s} "
                f"{'answer p50':>10s} {'p90':>7s} {'model p50':>9s} "
                f"{'calls':>5s} {'s/call':>6s} {'tools':>6s} {'router':>6s} "
                f"{'cost/task':>10s} {'light%':>6s}")
@@ -194,7 +216,8 @@ def summarize(rows: list[dict]) -> str:
         s = stats[a]
         mp = f"{s['must_pass']}/{s['ok']}"
         cost = f"${s['cost_mean']:.5f}" + ("" if s["prices_known"] else "*")
-        out.append(f"{a:6s} {s['runs']:4d} {s['ok']:3d} {mp:>9s} "
+        ans = f"{s['answered']}/{s['ok']}"
+        out.append(f"{a:10s} {s['runs']:4d} {s['ok']:3d} {ans:>8s} {mp:>9s} "
                    f"{s['answer_p50']:9.1f}s {s['answer_p90']:6.1f}s {s['model_p50']:8.1f}s "
                    f"{s['calls_p50']:5.0f} {s['call_p50']:5.1f}s {s['tools_p50']:5.1f}s "
                    f"{s['router_p50']:5.2f}s {cost:>10s} {100 * s['light_share']:5.0f}%")
@@ -215,7 +238,7 @@ def summarize(rows: list[dict]) -> str:
 
             mp_a = s["must_pass"] / s["ok"] if s["ok"] else 0
             mp_b = base["must_pass"] / base["ok"] if base["ok"] else 0
-            out.append(f"  {a:6s} answer time {d(s['answer_p50'], base['answer_p50']):>6s}   "
+            out.append(f"  {a:10s} answer time {d(s['answer_p50'], base['answer_p50']):>6s}   "
                        f"model time {d(s['model_p50'], base['model_p50']):>6s}   "
                        f"cost {d(s['cost_mean'], base['cost_mean']):>6s}   "
                        f"must-pass {100 * (mp_a - mp_b):+.0f} pts")
@@ -256,10 +279,11 @@ def summarize(rows: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 async def main_async(args: argparse.Namespace) -> int:
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    if "jev" in arms and not os.getenv("OPENROUTER_API_KEY"):
-        print("The jev arm needs OPENROUTER_API_KEY. Without it the router "
+    jev_arms = [a for a in arms if a in ("jev", "jev-router", "openrouter-fixed")]
+    if jev_arms and not os.getenv("OPENROUTER_API_KEY"):
+        print(f"The {'/'.join(jev_arms)} arm needs OPENROUTER_API_KEY. Without it the router "
               "fail-safes every decision to the strong tier, which would just "
-              "re-run the baseline and report it as 'jev'. Refusing.",
+              "re-run the baseline and report it as Jev. Refusing.",
               file=sys.stderr)
         return 2
 
@@ -316,11 +340,13 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=600.0,
                    help="per-run ceiling in seconds")
     p.add_argument("--out", default=None)
-    p.add_argument("--summarize", metavar="JSON",
-                   help="re-print the summary of a saved run; runs nothing")
+    p.add_argument("--summarize", metavar="JSON", nargs="+",
+                   help="re-print the summary of saved run(s), merged -- e.g. a "
+                        "baseline file and a jev-router file; runs nothing")
     args = p.parse_args()
     if args.summarize:
-        rows = json.loads(Path(args.summarize).read_text(encoding="utf-8"))["rows"]
+        rows = [r for f in args.summarize
+                for r in json.loads(Path(f).read_text(encoding="utf-8"))["rows"]]
         print(summarize(rows))
         return 0
     return asyncio.run(main_async(args))

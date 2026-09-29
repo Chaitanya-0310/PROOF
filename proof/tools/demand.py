@@ -37,6 +37,59 @@ def get_orders_for_run(run_id: int) -> dict:
              "everyone: strategic > core > standard.")
 
 
+def get_orders_for_runs(run_ids: list[int]) -> dict:
+    """Customer orders committed to ANY of a set of runs, one row per order.
+
+    Built for a material shortage, which breaks dozens of runs at once --
+    pass the short run_ids from the inventory runout. Like get_orders_for_run
+    it goes through allocations, so an order here is exposed to those runs by
+    fact, not by a SKU-and-date guess.
+    """
+    result = query(f"""
+        SELECT o.order_code, c.name AS customer, c.priority_tier,
+               k.sku_code, k.name AS sku_name,
+               (ol.qty_units - ol.qty_fulfilled)::int AS units_outstanding,
+               SUM(a.allocated_units)::int            AS units_from_these_runs,
+               array_agg(DISTINCT a.run_id ORDER BY a.run_id) AS run_ids,
+               min(r.planned_start)                   AS earliest_run_start,
+               o.promised_ship_at,
+               round(EXTRACT(EPOCH FROM (o.promised_ship_at - {NOW})) / 3600, 1)
+                   AS hours_until_ship
+        FROM scm.run_order_allocations a
+        JOIN ops.production_runs r       ON r.run_id = a.run_id
+        JOIN scm.customer_order_lines ol ON ol.order_line_id = a.order_line_id
+        JOIN scm.customer_orders o       ON o.order_id = ol.order_id
+        JOIN scm.customers c             ON c.customer_id = o.customer_id
+        JOIN ops.skus k                  ON k.sku_id = ol.sku_id
+        WHERE a.run_id = ANY(%s) AND o.status = 'open'
+        GROUP BY o.order_code, c.name, c.priority_tier, k.sku_code, k.name,
+                 ol.qty_units, ol.qty_fulfilled, o.promised_ship_at
+        ORDER BY CASE c.priority_tier WHEN 'strategic' THEN 0
+                                      WHEN 'core' THEN 1 ELSE 2 END,
+                 o.promised_ship_at
+    """, (list(run_ids),),
+        note="units_from_these_runs is the part of each order those runs were "
+             "going to make -- the units lost if none of them is built. "
+             "priority_tier ranks who to protect: strategic > core > standard. "
+             "Quote totals from `summary`, not by counting rows.")
+
+    rows = result["rows"]
+    tiers: dict[str, dict] = {}
+    for r in rows:
+        t = tiers.setdefault(r["priority_tier"], {"orders": 0, "units_from_these_runs": 0})
+        t["orders"] += 1
+        t["units_from_these_runs"] += r["units_from_these_runs"]
+    result["summary"] = {
+        "orders": len(rows),
+        "customers": len({r["customer"] for r in rows}),
+        "units_outstanding": sum(r["units_outstanding"] for r in rows),
+        "units_from_these_runs": sum(r["units_from_these_runs"] for r in rows),
+        "by_priority_tier": tiers,
+        "earliest_ship": min((r["promised_ship_at"] for r in rows), default=None),
+    }
+    return result
+
+
 def get_at_risk_orders(plant_code: str, within_hours: int = 24) -> dict:
     """Open orders shipping soon whose supplying runs are behind or stopped.
 

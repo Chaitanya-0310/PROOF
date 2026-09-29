@@ -119,8 +119,18 @@ def project_material_runout(plant_code: str, material_code: str) -> dict:
     a running balance. The first row with a negative balance is the runout.
     Returning the whole walk rather than just a date lets the agent say which
     run is the one that breaks, which is the actionable part.
+
+    The walk stops at the next inbound PO's ETA (or 7 days out if none is
+    open), because that is the window the shortage lasts. An earlier version
+    capped it at LIMIT 40 instead, and the agent reported "40 runs broken" --
+    the cap, not the count -- while the real window held more. The totals now
+    come back in `summary`, computed over every run in the window, so nobody
+    has to count rows to get them.
     """
-    return query(f"""
+    pos = get_open_purchase_orders(plant_code, material_code)["rows"]
+    resupply = pos[0] if pos else None  # ordered by eta_at
+
+    result = query(f"""
         WITH stock AS (
             SELECT COALESCE(SUM(i.qty_on_hand), 0) AS qty
             FROM scm.inventory_lots i
@@ -130,7 +140,7 @@ def project_material_runout(plant_code: str, material_code: str) -> dict:
               AND i.status = 'available'
         ),
         sched AS (
-            SELECT r.run_id, r.planned_start, l.line_code, k.sku_code,
+            SELECT r.run_id, r.planned_start, l.line_code, k.sku_id, k.sku_code,
                    k.name AS sku_name, r.planned_units,
                    r.planned_units * b.qty_per_unit AS material_needed
             FROM ops.production_runs r
@@ -141,17 +151,72 @@ def project_material_runout(plant_code: str, material_code: str) -> dict:
             JOIN scm.materials m ON m.material_id = b.material_id
             WHERE p.plant_code = %s AND m.material_code = %s
               AND r.planned_start >= {NOW} AND r.status = 'scheduled'
+              AND r.planned_start < COALESCE(%s::timestamptz,
+                                             {NOW} + interval '7 days')
+        ),
+        walk AS (
+            SELECT sched.*,
+                   (SELECT qty FROM stock)
+                   - SUM(sched.material_needed) OVER (ORDER BY sched.planned_start,
+                                                              sched.run_id)
+                       AS balance
+            FROM sched
         )
-        SELECT sched.planned_start, sched.line_code, sched.sku_code,
-               sched.sku_name, sched.planned_units,
-               round(sched.material_needed, 1) AS material_needed,
-               round((SELECT qty FROM stock)
-                     - SUM(sched.material_needed) OVER (ORDER BY sched.planned_start,
-                                                                sched.run_id), 1)
-                   AS balance_after_run
-        FROM sched
-        ORDER BY sched.planned_start, sched.run_id
-        LIMIT 40
-    """, (plant_code, material_code, plant_code, material_code),
-        note="The first row where balance_after_run goes negative is the run "
-             "that cannot be built. Compare that timestamp to the PO ETA.")
+        SELECT run_id, planned_start, line_code, sku_id, sku_code, sku_name,
+               planned_units,
+               round(material_needed, 1) AS material_needed,
+               round(balance, 1)         AS balance_after_run,
+               balance < 0               AS short
+        FROM walk
+        ORDER BY planned_start, run_id
+    """, (plant_code, material_code, plant_code, material_code,
+          resupply["eta_at"] if resupply else None),
+        note="Rows cover every scheduled run until the next inbound PO arrives "
+             "(summary.window_end). The first row with short=true is the run "
+             "that cannot be built. Report counts and the deficit from "
+             "`summary`, not by counting rows. The balance does not credit the "
+             "PO: compare summary.deficit_at_window_end to summary.resupply_qty "
+             "to see whether the PO even closes the gap. summary.short_run_ids "
+             "is what the demand agent needs to find the orders hit.")
+    result["summary"] = _runout_summary(result["rows"], resupply)
+    return result
+
+
+def _runout_summary(rows: list[dict], resupply: dict | None) -> dict:
+    """Totals over the whole runout walk -- the numbers a headline needs.
+
+    Computed here, not by the model, for the same reason `days_late` is:
+    counting 46 rows and summing a column is where an LLM quietly slips.
+    """
+    short = [r for r in rows if r["short"]]
+    deficit = max(0, -rows[-1]["balance_after_run"]) if rows else 0
+
+    by_sku: dict[str, dict] = {}
+    for r in short:
+        s = by_sku.setdefault(r["sku_code"], {
+            "sku_id": r["sku_id"], "sku_code": r["sku_code"],
+            "sku_name": r["sku_name"], "short_runs": 0, "planned_units": 0,
+            "first_short_start": r["planned_start"]})
+        s["short_runs"] += 1
+        s["planned_units"] += r["planned_units"]
+
+    first = short[0] if short else None
+    return {
+        "window_end": resupply["eta_at"] if resupply else "now + 7 days (no open PO)",
+        "resupply_po": resupply["po_code"] if resupply else None,
+        "resupply_qty": resupply["qty"] if resupply else None,
+        "resupply_uom": resupply["uom"] if resupply else None,
+        "runs_in_window": len(rows),
+        "runs_short": len(short),
+        "planned_units_short": sum(r["planned_units"] for r in short),
+        "first_short_run": {k: first[k] for k in (
+            "run_id", "planned_start", "line_code", "sku_id", "sku_code",
+            "sku_name", "planned_units", "material_needed",
+            "balance_after_run")} if first else None,
+        "short_run_ids": [r["run_id"] for r in short],
+        "deficit_at_window_end": deficit,
+        "resupply_covers_deficit": (resupply["qty"] >= deficit
+                                    if resupply else None),
+        "short_skus": sorted(by_sku.values(),
+                             key=lambda s: s["first_short_start"]),
+    }
