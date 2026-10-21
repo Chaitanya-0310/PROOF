@@ -73,24 +73,39 @@ def query(sql: str, params: tuple | dict = (), *,
         # snapshot for the life of the process -- these servers are long-lived.
         conn.rollback()
         _otel_set_rows(len(rows))
+        # The query and what it returned, shown as this observation's
+        # input/output in Langfuse.
+        from proof.trace import set_io
+        set_io(_otel_current(), input={"sql": tidied, "params": _shown(params)},
+               output={"row_count": len(rows), "rows": rows[:50]})
 
-    # Echo params back in whichever shape they arrived. list(dict) would
-    # return only the KEYS, which looks like data and is not.
-    if isinstance(params, dict):
-        # An embedding literal is ~6KB of digits and would swamp the result
-        # the model reads. Summarise it; the query text still shows where it
-        # was used.
-        shown = {k: (f"<vector[{v.count(',') + 1}]>"
-                     if isinstance(v, str) and v.startswith("[") and len(v) > 200
-                     else v)
-                 for k, v in params.items()}
-    else:
-        shown = list(params)
+    shown = _shown(params)
 
     out = {"rows": rows, "row_count": len(rows), "sql": _tidy(sql), "params": shown}
     if note:
         out["note"] = note
     return out
+
+
+def _shown(params: tuple | dict):
+    """Params as echoed to the model and the trace, in the shape they arrived.
+
+    list(dict) would return only the KEYS, which looks like data and is not.
+    An embedding literal is ~6KB of digits and would swamp the result, so it
+    is summarised; the query text still shows where it was used.
+    """
+    if isinstance(params, dict):
+        return {k: (f"<vector[{v.count(',') + 1}]>"
+                    if isinstance(v, str) and v.startswith("[") and len(v) > 200
+                    else v)
+                for k, v in params.items()}
+    return list(params)
+
+
+def _otel_current():
+    from opentelemetry import trace as _otel
+
+    return _otel.get_current_span()
 
 
 def _otel_set_rows(n: int) -> None:

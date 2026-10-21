@@ -45,6 +45,9 @@ PROBES = {
     "demand": ("get_orders_for_run", {"run_id": 923}),
     "actions": ("whoami", {}),
     "quality": ("get_sku_allergens", {"category": "sweet_goods"}),
+    "analytics": ("run_sql", {"sql": "SELECT plant_code, count(*) AS lines "
+                                     "FROM ops.lines l JOIN ops.plants p USING (plant_id) "
+                                     "GROUP BY plant_code ORDER BY plant_code"}),
 }
 
 

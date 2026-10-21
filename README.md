@@ -431,6 +431,114 @@ production baseline; no dollar value is assigned per unit.
 
 ---
 
+## Text-to-SQL — questions no tool was written for
+
+Every tool above runs SQL a person wrote, so a question nobody anticipated
+("which supplier is late most often?") had no answer. Text-to-SQL lets the
+model write the query, without handing it all 23 tables: a **table router**
+picks the few a question needs, and only their DDL goes into the prompt.
+
+```bash
+make migrate         # once, on a database created before this feature
+make sql-index       # introspect + enrich + embed every table (re-run on schema change)
+make smoke-sql       # router recall eval + guard tests (no API key)
+make sql Q="which supplier has the most late purchase orders?"
+make sql Q="..." ROUTE=1    # just show which tables the router picked
+```
+
+```
+question ─► hybrid retrieval over meta.schema_index (top-4 tables)
+         ─► + join-path bridges + the pinned sim clock     (~6 of 23 tables)
+         ─► prompt with only that DDL ─► one SELECT
+         ─► guard ─► read-only execution ─► repair on error (≤2) ─► answer + SQL
+```
+
+- **The index is built from the live schema.** Columns, keys, CHECK values
+  ("one of: 'open','shipped'"), observed codes ('TOR1', 'SO-100001') and the
+  business notes in [`proof/text2sql/descriptions.py`](proof/text2sql/descriptions.py)
+  become enriched DDL, embedded on CPU like the SOPs. A new table is indexed
+  from its DDL alone; adding its description makes it easier to find.
+- **Retrieval is the same hybrid as Phase 3**: Postgres full-text plus
+  pgvector, weighted RRF.
+- **Join-path bridging is what makes top-k work.** Retrieval scores tables one
+  at a time, so "which customers does run 923 supply" retrieves the endpoints
+  and misses what connects them. The router adds the cheapest foreign-key path
+  between retrieved tables. It prefers tables already selected, and it
+  penalises routing through a shared dimension (orders → plant ← lines). That
+  join type would return every run at the plant instead of the allocated one.
+
+```
+18 labelled questions, top_k=4    recall   all tables present   tables in prompt
+lexical                            83.8%        72.2%                4.8
+dense                              81.1%        72.2%                5.0
+hybrid                             86.5%        72.2%                5.0
+hybrid + join bridges              94.6%        88.9%                5.7 of 23
+```
+
+- **When the router misses, the query is retried instead of guessed.** A reply
+  of `CANNOT_ANSWER` triggers one retry with a wider schema slice. A query that
+  names a real table the model was not shown gets that table's DDL on the
+  repair turn. A database error goes back verbatim.
+- **Model-written SQL gets four layers of protection** ([`guard.py`](proof/text2sql/guard.py)):
+  the `agent_read` role, a read-only transaction with a 5 s timeout, a static
+  check (one SELECT/WITH, no write keywords, no `pg_sleep` / `query_to_xml` /
+  file reads), and an allow-list of the relations EXPLAIN says the query reads
+  (ops/scm/qms/act only). Results are capped at 500 rows through a server-side
+  cursor, and a capped result says row_count is not a total. `smoke-sql`
+  bypasses the static check and confirms Postgres itself refuses the write.
+- **Inside the agent system it is a sixth domain.** `analytics_server.py`
+  exposes `find_tables`, `describe_tables` and `run_sql`. The sub-agent's own
+  model writes the SQL, so like every server this one holds no model key. Its
+  charter makes it a fallback: the domain tools encode rules (the scrap clock,
+  allocation-based impact, citations) that ad-hoc SQL would miss.
+
+**Limits:** reads are not plant-scoped (neither are the existing read tools).
+The router eval is 18 questions, enough to catch a regression, not to certify
+accuracy. There is no golden-SQL accuracy eval yet: answers are checked by
+hand.
+
+---
+
+## Idempotency and reliability
+
+```bash
+make migrate             # idempotent post-bootstrap migrations (safe to re-run)
+make smoke-reliability   # proposals, discovery, timeouts, retries (no API key)
+```
+
+**Proposals are idempotent.** The agent's only write can repeat without
+anyone meaning it to. The coordinator may re-ask in a later round, a tool call
+may be retried, or a supervisor may ask twice. Each proposal now carries a key
+built from what it asks for: who, which action, which plant, and the
+run/order/PO/scope. The wording is not part of the key. While a matching
+proposal is pending and unexpired, proposing it again returns the existing
+action with `deduplicated: true` and logs nothing new. A transaction-scoped
+advisory lock makes check-then-insert atomic: eight concurrent identical
+proposals produce one row. An expired proposal never blocks a new one.
+
+**Tool discovery** ([`discovery.py`](proof/agents/discovery.py)), once per
+question per domain:
+- The handshake's **`instructions` now reach the sub-agent's system prompt**.
+  Before this they were dropped, so server-side caveats never reached a model.
+  Tools are listed once and reused by every delegation.
+- Discovered tools are validated. No tools, or duplicate names, fail the
+  domain; a malformed schema is dropped with a warning.
+- **One broken server fails its domain, not the question.** A server that
+  crashes or hangs in its handshake is retried once, then marked unavailable.
+  The coordinator sees this in its roster and answers from the other domains
+  under "Not determined".
+
+**Every tool call** has a deadline (`PROOF_TOOL_TIMEOUT_S`, default 60 s). A
+call is **retried only if its server declares it safe**, via the MCP tool
+annotations `read_only_hint` / `idempotent_hint`, never inferred from a name.
+Read tools are annotated read-only by default in `_serve.build`. The
+proposals are idempotent writes. An unannotated tool gets one attempt, and on
+failure it says the outcome is unknown. A server whose connection closes is
+latched as dead, so later calls fail at once instead of each waiting out the
+timeout.
+
+---
+
 ## Design decisions worth arguing about
 
 **Three schemas in one database.** Real plants have three systems. The schema

@@ -30,3 +30,4 @@ node_modules/
 docs/video/**/out/
 docs/video/**/*.wav
 docs/video/**/*.mp4
+docs/video/

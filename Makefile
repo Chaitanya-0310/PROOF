@@ -24,6 +24,8 @@ PY      = uv run python
 .PHONY: smoke smoke-mcp smoke-cache bench-router smoke-rag smoke-authz index ask demo1 demo2 demo3
 .PHONY: pending approve reject smoke-trace eval-check eval
 .PHONY: baseline baseline-live
+.PHONY: api web web-install
+.PHONY: migrate sql-migrate sql-index smoke-sql sql smoke-reliability
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -92,6 +94,9 @@ index: ## Phase 3 -- parse the SOP corpus and build the hybrid index
 smoke-rag: ## Phase 3 -- retrieval eval + citation enforcement (no API key)
 	$(PY) scripts/smoke_rag.py
 
+smoke-reliability: ## Idempotent proposals, discovery, timeouts and retries (no API key)
+	$(PY) scripts/smoke_reliability.py
+
 smoke-authz: ## Phase 4 -- identity, authz and the approval queue (no API key)
 	$(PY) scripts/smoke_authz.py
 
@@ -130,6 +135,34 @@ baseline: ## Phase 6 -- scrap avoided + time-to-decision, offline (no API key)
 
 baseline-live: ## Phase 6 -- same, but runs the agent to measure real time (needs a key)
 	$(PY) scripts/run_baseline.py --live
+
+# --- Text-to-SQL ----------------------------------------------------------
+# Ad-hoc questions with no hand-written tool. A router picks the few tables a
+# question needs; only their DDL goes into the prompt; the query runs
+# read-only. `sql-migrate` is for a database created before this feature
+# (db/init only runs on an empty volume); a fresh `make up` already has it.
+
+# Migrations added after a database was first created. db/init runs only on
+# an empty volume, so these are replayed here. Each file is idempotent
+# (IF NOT EXISTS throughout): running `make migrate` twice is a no-op.
+MIGRATIONS = db/init/08_schema_index.sql db/init/09_action_idempotency.sql
+
+migrate: ## Apply the idempotent post-bootstrap migrations to an existing database
+	@for f in $(MIGRATIONS); do \
+	  echo "-- $$f"; \
+	  $(COMPOSE) exec -T db psql -q -v ON_ERROR_STOP=1 -U $${POSTGRES_SUPERUSER:-postgres} -d $${POSTGRES_DB:-proof} < $$f || exit 1; \
+	done
+
+sql-migrate: migrate ## Text-to-SQL -- alias for `make migrate`
+
+sql-index: ## Text-to-SQL -- introspect, enrich and embed every table (re-run on schema change)
+	$(PY) proof/text2sql/index.py
+
+smoke-sql: ## Text-to-SQL -- router recall eval + guard tests (no API key)
+	$(PY) scripts/smoke_text2sql.py
+
+sql: ## Text-to-SQL -- answer a question:  make sql Q="..." [K=4] [ROUTE=1] [SQLONLY=1]
+	$(PY) -m proof.text2sql $(if $(K),-k $(K),) $(if $(ROUTE),--route-only,) $(if $(SQLONLY),--sql-only,) "$(Q)"
 
 # --- Frontend: operator console (React SPA + FastAPI) --------------------
 # Run these in two terminals: `make api` then `make web`, and open :5173.

@@ -1,7 +1,7 @@
 """Production MCP server -- stands in for MES/SCADA.
 
 Exposes line state, downtime, output-loss arithmetic, alternate-line search
-and scrap analytics. Six tools, deliberately: this is the narrow surface the
+and scrap analytics. Seven tools, deliberately: this is the narrow surface the
 Production Agent reasons over.
 """
 from __future__ import annotations
@@ -38,10 +38,39 @@ def get_open_downtime(plant_code: str | None = None) -> str:
 def get_line_status(line_id: int) -> str:
     """What a line is currently running: SKU, rate, plan vs actual, schedule.
 
+    line_id is an internal database id, NOT the line number people say:
+    line_id 1 is one specific plant's Line 1, and "Line 1 at DAL1" has a
+    different line_id. If you only have a plant and a line number or product,
+    call get_running_lines instead. Use this when a line_id came from another
+    tool (e.g. get_open_downtime).
+
     Args:
-        line_id: Numeric line id, as returned by get_open_downtime.
+        line_id: Numeric line id, as returned by get_open_downtime or
+            get_running_lines.
     """
     return text_result(production.get_line_status(line_id))
+
+
+@server.tool()
+def get_running_lines(plant_code: str | None = None,
+                      category: str | None = None,
+                      line_code: str | None = None) -> str:
+    """Which lines are running what right now. Start here for "what is running".
+
+    Use this for "what's running on Line 1 at DAL1?" (plant_code="DAL1",
+    line_code="L1") and for "which line is making sweet goods?" (category),
+    i.e. whenever you do not yet hold a line_id. One row per line: line_id,
+    current SKU, category, run status and is_stopped. With `category` set,
+    only lines currently producing it are returned; an empty result means
+    none is in production.
+
+    Args:
+        plant_code: Restrict to one plant, e.g. DAL1. Omit for all plants.
+        category: Product category: sweet_goods, flatbread or artisan.
+        line_code: The plant's own line label as people say it: "L1", "Line 1"
+            or "1". Not the numeric line_id. Pair with plant_code.
+    """
+    return text_result(production.get_running_lines(plant_code, category, line_code))
 
 
 @server.tool()

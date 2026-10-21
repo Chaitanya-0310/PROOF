@@ -27,11 +27,14 @@ Python, stdio framing, JSON -- and is the honest residual, not a guess.
 from __future__ import annotations
 
 import contextvars
+import json
 import statistics
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+
+from proof import trace as ptrace
 
 # Which agent and model the code on this task is currently acting for. Set by
 # the coordinator loop and by each sub-agent; read by the HTTP hook to
@@ -190,11 +193,37 @@ async def _on_request(request) -> None:
     request.extensions["proof_t0"] = time.perf_counter()
     request.extensions["proof_agent"] = _current_agent.get()
     request.extensions["proof_model"] = _current_model.get()
+    # One Langfuse generation per model request, opened here so it is parented
+    # on the span of the agent that is calling. The hook sees the exact body
+    # sent, so the trace holds the real prompt, not a reconstruction of it.
+    if "/messages" in request.url.path:
+        try:
+            body = json.loads(request.content)
+            if isinstance(body, dict) and not body.get("stream"):
+                agent = _current_agent.get()
+                request.extensions["proof_gen"] = ptrace.start_generation(
+                    f"llm:{agent}", body.get("model") or _current_model.get() or "?",
+                    body, agent)
+        except Exception:  # noqa: BLE001 - tracing never fails a model call
+            pass
 
 
 async def _on_response(response) -> None:
     tl = _current_timeline.get()
     ext = response.request.extensions
+    gen = ext.pop("proof_gen", None)
+    if gen is not None:
+        try:
+            await response.aread()  # cached; the SDK reads it again normally
+            raw = response.text
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = None
+            ptrace.end_generation(gen, response.status_code,
+                                  payload if isinstance(payload, dict) else None, raw)
+        except Exception:  # noqa: BLE001
+            gen.end()
     t0 = ext.get("proof_t0")
     # Only the Messages endpoint is a model call; anything else the client
     # might send (model listings, count_tokens) is not model time.
@@ -222,29 +251,70 @@ def timed_http_client():
 
 # --- tool-call timing: MCP session proxy ----------------------------------
 class TimedSession:
-    """Wraps an MCP ClientSession so every `call_tool` is timed.
+    """Wraps an MCP ClientSession so every `call_tool` is timed and traced.
 
     The SDK's MCP bridge (`async_mcp_tool`) only ever calls
     `call_tool(name=..., arguments=...)`; everything else is forwarded
     untouched.
+
+    Each call becomes a `tool` span holding the arguments, the full result the
+    model received and the MCP server it went to. The MCP SDK passes the trace
+    context into the server process, so the server's own `sql` span (query,
+    params, rows; see proof.tools._base.query) nests under this one.
     """
 
-    def __init__(self, session: Any, agent: str) -> None:
+    def __init__(self, session: Any, agent: str, server: str | None = None) -> None:
         self._session = session
         self._agent = agent
+        self._server = server
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._session, name)
 
     async def call_tool(self, name: str, arguments: Any = None, *args: Any, **kwargs: Any):
         start = time.perf_counter()
-        try:
-            return await self._session.call_tool(name=name, arguments=arguments,
-                                                 *args, **kwargs)
-        finally:
+        with ptrace.span(f"tool:{name}", "tool", tool=name, agent=self._agent,
+                         mcp_server=self._server) as sp:
+            ptrace.set_io(sp, input=arguments if arguments is not None else {})
+            try:
+                result = await self._session.call_tool(name=name, arguments=arguments,
+                                                       *args, **kwargs)
+            except BaseException as exc:
+                tl = _current_timeline.get()
+                if tl is not None:
+                    tl.add("tool", self._agent, name, start, time.perf_counter())
+                sp.set_attribute("langfuse.observation.level", "ERROR")
+                sp.set_attribute("langfuse.observation.status_message", str(exc))
+                raise
             tl = _current_timeline.get()
             if tl is not None:
                 tl.add("tool", self._agent, name, start, time.perf_counter())
+            try:
+                _trace_tool_result(sp, name, arguments, result)
+            except Exception:  # noqa: BLE001 - tracing never fails a tool call
+                pass
+            return result
+
+
+def _trace_tool_result(sp: Any, name: str, arguments: Any, result: Any) -> None:
+    """Record what the tool returned."""
+    blocks = getattr(result, "content", None) or []
+    text = "\n".join(getattr(b, "text", "") for b in blocks if getattr(b, "text", None))
+    ptrace.set_io(sp, output=text)
+    if getattr(result, "is_error", None) or getattr(result, "isError", None):
+        sp.set_attribute("langfuse.observation.level", "ERROR")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("authorization") == "denied":
+        sp.set_attribute("langfuse.observation.level", "WARNING")
+        sp.set_attribute("proof.authorization", "denied")
+    if payload.get("row_count") is not None:
+        sp.set_attribute("proof.row_count", payload["row_count"])
+
 
 
 def format_report(r: dict[str, Any]) -> str:

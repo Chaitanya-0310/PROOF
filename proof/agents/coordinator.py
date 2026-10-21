@@ -32,17 +32,17 @@ from pathlib import Path
 from typing import Any
 
 from anthropic import AsyncAnthropic, Omit, beta_async_tool
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
 from proof.identity import Principal, resolve
+from proof import trace as ptrace
 from proof.trace import record_usage, span
 
 from .budget import BudgetExceeded, SessionBudget, billed_cost
 from .config import (COORDINATOR_MODEL, OPENROUTER_REQUEST_KWARGS, REQUEST_KWARGS,
                      SUBAGENT_MODEL, estimate_cost)
 from .router import OPENROUTER_ANTHROPIC_BASE, route
-from .servers import ROOT, SERVERS, ServerSpec
+from .discovery import DomainSession, open_domain
+from .servers import SERVERS
 from .loopguard import LoopGuard, required_args
 from .subagent import SubAgentResult, run_subagent
 from .timing import Timeline, acting_as, timed_http_client, timeline_scope
@@ -52,7 +52,7 @@ You are PROOF, the operations coordinator for a bakery manufacturing network
 (3 plants, 12 lines, 40 SKUs). You support plant managers and supply chain
 planners who are mid-shift and need a decision, not a report.
 
-You have five domain agents. Ask them questions in plain English:
+You have these domain agents. Ask them questions in plain English:
 
 {roster}
 
@@ -222,25 +222,6 @@ class CoordinatorResult:
         return estimate_cost(self.total_input, self.total_output)
 
 
-async def _open_session(stack: AsyncExitStack, spec: ServerSpec,
-                        principal: Principal) -> ClientSession:
-    """Launch one MCP server subprocess and initialise a session against it.
-
-    The principal is injected into the subprocess environment HERE, once,
-    by the authenticated client. It never travels through the model.
-    """
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(ROOT / "mcp_servers" / spec.script)],
-        cwd=str(ROOT / "mcp_servers"),
-        env=spec.env(principal),
-    )
-    read, write = await stack.enter_async_context(stdio_client(params))
-    session = await stack.enter_async_context(ClientSession(read, write))
-    await session.initialize()
-    return session
-
-
 async def ask(question: str, *, verbose: bool = False,
               principal: Principal | None = None,
               streamer: Any = None) -> CoordinatorResult:
@@ -268,6 +249,12 @@ async def ask(question: str, *, verbose: bool = False,
             "session", "session", principal=principal.principal_id,
             model=COORDINATOR_MODEL))
 
+        ptrace.set_trace_info(
+            session_span, name="proof.ask", user=principal.principal_id,
+            tags=[principal.role, *principal.plant_scope], input=question,
+            role=principal.role, plant_scope=list(principal.plant_scope))
+        ptrace.set_io(session_span, input=question)
+
         # The coordinator's routing decision needs only the question, so it
         # runs WHILE the MCP servers spawn. Startup takes seconds and a Jev
         # decision well under one, so on this path routing costs the user no
@@ -278,12 +265,27 @@ async def ask(question: str, *, verbose: bool = False,
         # All five servers come up before the coordinator plans. Lazy-starting
         # them per delegation would put subprocess spawn latency inside the
         # agent loop, where it is indistinguishable from the model thinking.
-        with timeline.measure("startup", "mcp spawn x5", agent="session"):
-            sessions = {name: await _open_session(stack, spec, principal)
-                        for name, spec in SERVERS.items()}
+        #
+        # A server that fails to start is retried once, then marked down for
+        # this question; the others carry on. See discovery.py.
+        with timeline.measure("startup", f"mcp spawn x{len(SERVERS)}", agent="session"):
+            domains: dict[str, DomainSession] = {
+                name: await open_domain(stack, spec, principal)
+                for name, spec in SERVERS.items()}
+        down = {n: d.unavailable_reason for n, d in domains.items() if not d.available}
+        session_span.set_attribute("proof.domains_down", sorted(down))
+        for name, d in domains.items():
+            for w in d.warnings:
+                print(f"  ! {name} discovery: {w}", file=sys.stderr)
+        for name, why in down.items():
+            print(f"  ! {name} agent unavailable: {why}", file=sys.stderr)
 
+        t_route = time.time_ns()
         coord_route = await coord_route_task
         coord_model = coord_route.model
+        ptrace.emit_span("route:coordinator", "router", t_route, time.time_ns(),
+                         input={"question": question}, output=coord_route.as_dict(),
+                         model=coord_model, route=coord_route.reason)
         budget.add_cost(coord_route.cost_usd)
         # One OpenRouter client per question, opened on first use by whichever
         # of the coordinator or a sub-agent is routed there.
@@ -310,7 +312,26 @@ async def ask(question: str, *, verbose: bool = False,
             # model saw an undocumented field -- and when a gateway sends the
             # call with empty arguments, nothing in the schema helps it recover.
             async def delegate(question: str) -> str:
+                # The coordinator's tool call: the question it asked, and the
+                # text it got back. The sub-agent's own work nests beneath it.
+                with span(f"tool:ask_{domain}_agent", "tool", domain=domain,
+                          tool=f"ask_{domain}_agent") as tsp:
+                    ptrace.set_io(tsp, input={"question": question})
+                    out = await _delegate(question, tsp)
+                    ptrace.set_io(tsp, output=out)
+                    return out
+
+            async def _delegate(question: str, tsp: Any) -> str:
                 delegate_question = question
+                if not domains[domain].available:
+                    why = domains[domain].unavailable_reason
+                    tsp.set_attribute("proof.domain_unavailable", why)
+                    if verbose:
+                        print(f"  -> {domain} agent: UNAVAILABLE ({why})", file=sys.stderr)
+                    return (f"[{domain} agent UNAVAILABLE] {why}\n"
+                            f"Do not ask this agent again in this question. Answer "
+                            f"from the other agents and list what the {domain} "
+                            f"domain would have provided under \"Not determined\".")
                 if verbose:
                     print(f"  -> {domain} agent: {delegate_question}", file=sys.stderr)
                 
@@ -326,6 +347,7 @@ async def ask(question: str, *, verbose: bool = False,
                 cached_result = get_cached_subagent_response(
                     principal, domain, delegate_question)
                 if cached_result:
+                    tsp.set_attribute("proof.cache_hit", True)
                     cached_result.answer = f"[Semantic Cache Hit]\n{cached_result.answer}"
                     collected.append(cached_result)
                     if verbose:
@@ -339,14 +361,19 @@ async def ask(question: str, *, verbose: bool = False,
                                        delegate_question, domain=domain,
                                        charter=spec.charter)
                 budget.add_cost(decision.cost_usd)
+                tsp.set_attribute("proof.cache_hit", False)
+                tsp.set_attribute("proof.route", decision.reason)
+                tsp.set_attribute("proof.model", decision.model)
                 if verbose:
                     print(f"     route: {decision.model} ({decision.reason})",
                           file=sys.stderr)
 
                 sub_client, sub_kwargs = client_for(decision.provider)
+                d = domains[domain]
                 result = await run_subagent(
-                    spec, sessions[domain], delegate_question, sub_client, budget,
-                    streamer, model=decision.model, request_kwargs=sub_kwargs)
+                    spec, d.session, delegate_question, sub_client, budget,
+                    streamer, model=decision.model, request_kwargs=sub_kwargs,
+                    tools=d.tools, instructions=d.instructions)
                 result.route = decision.as_dict()
 
                 set_cached_subagent_response(
@@ -375,6 +402,9 @@ async def ask(question: str, *, verbose: bool = False,
 
         roster = "\n".join(
             f"- ask_{name}_agent: {spec.charter}"
+            + (f"\n  UNAVAILABLE for this question ({down[name]}). Do not ask it; "
+               f"name what it would have provided under \"Not determined\"."
+               if name in down else "")
             for name, spec in SERVERS.items())
 
         # Rendered from the session principal, never from the conversation --
@@ -457,6 +487,9 @@ async def ask(question: str, *, verbose: bool = False,
                 f"\n[stopped by the session budget: {exc}. This answer is "
                 f"partial. Re-ask with a narrower question.]")
 
+        final_answer = "\n".join(final_text) or "(no answer produced)"
+        ptrace.set_io(session_span, output=final_answer)
+        ptrace.set_trace_output(session_span, final_answer)
         record_usage(session_span, in_tok, out_tok, coord_model)
         session_span.set_attribute("proof.model_calls", budget.model_calls)
         session_span.set_attribute("proof.delegations", len(collected))
@@ -468,6 +501,9 @@ async def ask(question: str, *, verbose: bool = False,
     # Shutdown is real wall time for a CLI user but not part of producing the
     # answer, so it is recorded separately rather than folded into "other".
     timeline.add("teardown", "session", "mcp shutdown", t_answer, time.perf_counter())
+    # Langfuse export is batched; push it now so the run is visible at once
+    # (and survives a short-lived CLI process).
+    await asyncio.to_thread(ptrace.flush)
     timeline.finish()
     timing = timeline.report()
     timing["time_to_answer_s"] = round(t_answer - timeline.t0, 3)

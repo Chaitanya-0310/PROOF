@@ -26,19 +26,49 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
 
 from proof.tools._base import as_text  # noqa: E402
 
+# MCP tool annotations: the server's declaration of what calling a tool does.
+# The client reads them at discovery (proof/agents/discovery.py) and decides
+# from them, not from tool names, which calls are safe to retry. A tool with
+# no annotation is treated as unsafe to repeat.
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                            idempotent_hint=True, open_world_hint=False)
+# Writes that are safe to repeat: the proposal tools, which deduplicate on an
+# idempotency key in the database (proof/tools/actions.py), so a retried
+# call returns the action already queued instead of queueing another.
+IDEMPOTENT_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                   idempotent_hint=True, open_world_hint=False)
 
-def build(name: str, instructions: str) -> MCPServer:
-    """Create a server with the house instructions attached.
 
-    `instructions` reaches the model as server-level context. Keeping it here
-    rather than in each agent's system prompt means the guidance travels WITH
-    the tools -- if the production server is later consumed by something other
-    than this project, the caveats come along.
+def build(name: str, instructions: str, *, read_only: bool = True) -> MCPServer:
+    """Create a server with the house instructions and tool annotations attached.
+
+    `instructions` is returned in the MCP initialize handshake. The client
+    side (proof/agents/discovery.py) keeps it and puts it in the sub-agent's
+    system prompt, so the guidance travels WITH the tools -- if the
+    production server is later consumed by something other than this
+    project, the caveats come along.
+
+    With `read_only` (every server but the action queue), each tool is
+    annotated READ_ONLY unless its decorator says otherwise. The default is
+    applied here so a new tool cannot forget it; a write server passes
+    read_only=False and annotates each tool itself.
     """
-    return MCPServer(name=name, instructions=instructions)
+    server = MCPServer(name=name, instructions=instructions)
+    default = READ_ONLY if read_only else None
+    original = server.tool
+
+    def tool(fn=None, /, **kwargs):
+        kwargs.setdefault("annotations", default)
+        if callable(fn):             # bare @server.tool
+            return original(**kwargs)(fn)
+        return original(fn, **kwargs)
+
+    server.tool = tool
+    return server
 
 
 def text_result(result: dict) -> str:

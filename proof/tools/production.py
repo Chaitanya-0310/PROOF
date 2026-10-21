@@ -1,7 +1,7 @@
 """Production domain tools -- what the lines are doing and what stopping costs.
 
 Stands in for MES/SCADA. The Production Agent gets these and nothing else.
-That narrowness is the point: an agent with six well-chosen tools picks
+That narrowness is the point: an agent with seven well-chosen tools picks
 correctly far more reliably than one with thirty.
 """
 from __future__ import annotations
@@ -35,7 +35,11 @@ def get_open_downtime(plant_code: str | None = None) -> dict:
 
 
 def get_line_status(line_id: int) -> dict:
-    """What a line is running now: SKU, rate, planned vs actual, schedule."""
+    """What a line is running now: SKU, rate, planned vs actual, schedule.
+
+    `line_id` is the internal database id, not the line number people say.
+    To look up "Line 1 at DAL1" use `get_running_lines(plant_code, line_code)`.
+    """
     return query(f"""
         SELECT p.plant_code, l.line_code, l.name AS line_name, l.line_type,
                r.run_id, k.sku_id, k.sku_code, k.name AS sku_name, k.category,
@@ -53,6 +57,51 @@ def get_line_status(line_id: int) -> dict:
                ON c.line_id = l.line_id AND c.sku_id = r.sku_id
         WHERE l.line_id = %s
     """, (line_id,))
+
+
+def get_running_lines(plant_code: str | None = None,
+                      category: str | None = None,
+                      line_code: str | None = None) -> dict:
+    """Every line and what it is running now, optionally one product category.
+
+    The reverse of `get_line_status`: that needs a line_id and answers "what is
+    on this line"; this answers "which lines are making X" without knowing any
+    line_id first. One row per line, with the current run's SKU and category,
+    and whether the line is stopped (an open downtime event).
+
+    `category` matches case-insensitively and tolerates spaces or hyphens
+    ("sweet goods" -> sweet_goods). When given, lines with no current run or
+    a different category are left out, so an empty result means nothing of
+    that category is in production right now.
+
+    `line_code` is the plant's own line label ("L1", or "Line 1" / "1"), NOT
+    the database `line_id`. It is how people name a line ("Line 1 at DAL1"),
+    and the same code exists at several plants, so pair it with `plant_code`.
+    """
+    cat = category.strip().lower().replace(" ", "_").replace("-", "_") if category else None
+    code = None
+    if line_code:
+        digits = "".join(ch for ch in line_code if ch.isdigit())
+        code = f"L{digits}" if digits else line_code.strip().upper()
+    return query(f"""
+        SELECT p.plant_code, l.line_id, l.line_code, l.name AS line_name,
+               l.line_type, r.run_id, k.sku_id, k.sku_code, k.name AS sku_name,
+               k.category, r.status AS run_status,
+               r.planned_units, r.actual_units, r.planned_end,
+               EXISTS (SELECT 1 FROM ops.downtime_events d
+                       WHERE d.line_id = l.line_id AND d.ended_at IS NULL)
+                   AS is_stopped
+        FROM ops.lines l
+        JOIN ops.plants p ON p.plant_id = l.plant_id
+        LEFT JOIN ops.production_runs r
+               ON r.line_id = l.line_id
+              AND r.planned_start <= {NOW} AND r.planned_end > {NOW}
+        LEFT JOIN ops.skus k ON k.sku_id = r.sku_id
+        WHERE (%s::text IS NULL OR p.plant_code = %s)
+          AND (%s::text IS NULL OR k.category = %s)
+          AND (%s::text IS NULL OR l.line_code = %s)
+        ORDER BY p.plant_code, l.line_code
+    """, (plant_code, plant_code, cat, cat, code, code))
 
 
 def estimate_output_loss(line_id: int, minutes_down: int) -> dict:

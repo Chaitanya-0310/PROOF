@@ -10,6 +10,7 @@ agent is never in a position to claim something happened when it did not.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import timedelta
 from typing import Any
@@ -44,27 +45,55 @@ def _propose(principal: Principal, action_type: str, plant_code: str,
             record_denial(conn, principal, denial, sim_now(conn))
         return denial.as_tool_result()
 
+    key = idempotency_key(principal.principal_id, action_type, plant_code, payload)
     with connect("action_rw") as conn:
         now = sim_now(conn)
         with conn.cursor() as cur:
+            # Serialise concurrent proposals of the SAME action. Two retries
+            # racing each other both find nothing pending and both insert,
+            # unless the check and the insert happen under one lock. The lock
+            # is transaction-scoped, so a crash cannot leave it held.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
             cur.execute("""
-                INSERT INTO act.proposed_actions
-                    (action_type, plant_code, proposed_by, proposed_at,
-                     rationale, payload, source_question, expires_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING action_id, expires_at
-            """, (action_type, plant_code, principal.principal_id, now,
-                  rationale, json.dumps(payload), source_question,
-                  now + TTL[action_type]))
-            action_id, expires_at = cur.fetchone()
-            cur.execute("""
-                INSERT INTO act.decision_log (action_id, at, principal_id, event, detail)
-                VALUES (%s, %s, %s, 'proposed', %s)
-            """, (action_id, now, principal.principal_id, rationale))
+                SELECT action_id, expires_at FROM act.proposed_actions
+                WHERE idempotency_key = %s AND status = 'pending' AND expires_at > %s
+                ORDER BY action_id LIMIT 1
+            """, (key, now))
+            existing = cur.fetchone()
+            if existing is None:
+                cur.execute("""
+                    INSERT INTO act.proposed_actions
+                        (action_type, plant_code, proposed_by, proposed_at,
+                         rationale, payload, source_question, expires_at,
+                         idempotency_key)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING action_id, expires_at
+                """, (action_type, plant_code, principal.principal_id, now,
+                      rationale, json.dumps(payload), source_question,
+                      now + TTL[action_type], key))
+                action_id, expires_at = cur.fetchone()
+                cur.execute("""
+                    INSERT INTO act.decision_log (action_id, at, principal_id, event, detail)
+                    VALUES (%s, %s, %s, 'proposed', %s)
+                """, (action_id, now, principal.principal_id, rationale))
+            else:
+                action_id, expires_at = existing
         conn.commit()
 
     approver = ("a regional director" if action_type == "notify_customer"
                 else "the plant manager")
+    if existing is None:
+        note = (f"QUEUED, NOT DONE. Action {action_id} is pending approval by "
+                f"{approver} and expires at {expires_at:%H:%M}. Nothing has "
+                f"changed in the plant. Tell the user it awaits approval -- "
+                f"do not describe it as completed or scheduled.")
+    else:
+        # Say it plainly: the model must not report a second proposal, and
+        # the user should know theirs was already in the queue.
+        note = (f"ALREADY QUEUED, NOT DONE. An identical proposal is already "
+                f"pending as action {action_id}; no duplicate was created. It "
+                f"awaits approval by {approver} and expires at "
+                f"{expires_at:%H:%M}. Report it as one pending action.")
     return {
         "rows": [{
             "action_id": action_id,
@@ -74,14 +103,43 @@ def _propose(principal: Principal, action_type: str, plant_code: str,
             "proposed_by": principal.principal_id,
             "expires_at": expires_at.isoformat(),
             "approved_by": None,
+            "deduplicated": existing is not None,
         }],
         "row_count": 1,
-        "sql": "INSERT INTO act.proposed_actions (...) RETURNING action_id",
-        "note": (f"QUEUED, NOT DONE. Action {action_id} is pending approval by "
-                 f"{approver} and expires at {expires_at:%H:%M}. Nothing has "
-                 f"changed in the plant. Tell the user it awaits approval -- "
-                 f"do not describe it as completed or scheduled."),
+        "sql": ("INSERT INTO act.proposed_actions (...) RETURNING action_id"
+                if existing is None else
+                "SELECT action_id FROM act.proposed_actions "
+                "WHERE idempotency_key = %s AND status = 'pending' (no insert)"),
+        "note": note,
     }
+
+
+# The fields that identify WHAT a proposal asks for, per action type. The
+# rest of the payload is wording -- a redrafted customer message, a revised
+# units_at_risk estimate -- and must not turn the same request into a "new"
+# one that slips past deduplication.
+IDENTITY_FIELDS = {
+    "reallocate_run": ("run_id", "to_line"),
+    "notify_customer": ("order_code",),
+    "expedite_purchase_order": ("po_code",),
+    "hold_product": ("scope",),
+}
+
+
+def idempotency_key(principal_id: str, action_type: str, plant_code: str,
+                    payload: dict) -> str:
+    """Stable key for 'the same request', independent of wording.
+
+    The principal is part of it: two people proposing the same move are two
+    requests, and the no-self-approval rule depends on who proposed.
+    """
+    ident = {f: payload.get(f) for f in IDENTITY_FIELDS[action_type]}
+    for k, v in ident.items():
+        if isinstance(v, str):
+            ident[k] = v.strip().upper()
+    raw = json.dumps([principal_id, action_type, plant_code.strip().upper(), ident],
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def propose_reallocate_run(principal: Principal, plant_code: str,

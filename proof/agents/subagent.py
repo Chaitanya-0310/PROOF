@@ -22,7 +22,7 @@ from anthropic.lib.tools.mcp import async_mcp_tool
 from mcp import ClientSession
 
 from proof.rag.citations import check, citations_from_tool_results, enforce
-from proof.trace import record_usage, span
+from proof.trace import record_usage, set_io, span
 
 from .budget import SessionBudget, billed_cost
 from .loopguard import LoopGuard, required_args
@@ -35,7 +35,7 @@ You are the {domain} agent for a bakery manufacturing network.
 
 Your charter:
 {charter}
-
+{server_guidance}
 Rules:
 - Answer ONLY from your tools. Never estimate, recall or infer a plant number.
   If your tools cannot answer, say exactly what is missing and stop.
@@ -114,6 +114,19 @@ class SubAgentResult:
         return "\n".join(lines)
 
 
+def _server_guidance(spec: ServerSpec, instructions: str | None) -> str:
+    """The server's own instructions, as part of the sub-agent's system prompt.
+
+    Written by whoever owns the server, next to its tools, and returned in the
+    MCP handshake. Binding: they carry the caveats a tool's docstring has no
+    room for (the SQL rules, "a proposal is not an action").
+    """
+    if not instructions:
+        return ""
+    return (f"\nGuidance from the {spec.server_name} server, which owns your "
+            f"tools (binding):\n{instructions}\n")
+
+
 # How much of each tool result travels up verbatim. The sub-agent is told to
 # be terse, and it was: a 40-row runout came back as prose naming one run, so
 # the coordinator rendered an impact table of dashes and reported that the
@@ -144,7 +157,9 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
                        budget: "SessionBudget | None" = None,
                        streamer: Any = None,
                        model: str | None = None,
-                       request_kwargs: dict | None = None) -> SubAgentResult:
+                       request_kwargs: dict | None = None,
+                       tools: list | None = None,
+                       instructions: str | None = None) -> SubAgentResult:
     """Run one domain sub-agent against its MCP server.
 
     A `delegate` span wraps the whole call and every turn's tokens roll up
@@ -156,14 +171,17 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
     configured SUBAGENT_MODEL, i.e. behaviour without a router.
     `request_kwargs` overrides REQUEST_KWARGS when `client` is a different
     provider (OpenRouter) that must not receive Claude-only fields.
+    `tools` and `instructions` are what discovery (discovery.py) found when
+    the server started; omitted, the tools are listed here and the server
+    gives no guidance.
     """
     model = model or SUBAGENT_MODEL
     request_kwargs = REQUEST_KWARGS if request_kwargs is None else request_kwargs
     agent = f"subagent:{spec.domain}"
-    mcp_tools = (await session.list_tools()).tools
+    mcp_tools = tools if tools is not None else (await session.list_tools()).tools
     # TimedSession times each call_tool for the per-question breakdown;
     # everything else passes straight through to the real session.
-    timed = TimedSession(session, agent)
+    timed = TimedSession(session, agent, spec.server_name)
     tools = [async_mcp_tool(t, timed) for t in mcp_tools]
     guard = LoopGuard(required_args({t.name: t.input_schema for t in mcp_tools}))
 
@@ -173,9 +191,14 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
     in_tok = out_tok = 0
 
     with span(f"delegate:{spec.domain}", "delegate",
-              domain=spec.domain, model=model) as sp, acting_as(agent, model):
+              domain=spec.domain, model=model,
+              mcp_server=spec.server_name) as sp, acting_as(agent, model):
+        set_io(sp, input={"question": question, "domain": spec.domain,
+                          "model": model, "tools": [t.name for t in mcp_tools]})
         runner = client.beta.messages.tool_runner(
-            system=SUBAGENT_SYSTEM.format(domain=spec.domain, charter=spec.charter),
+            system=SUBAGENT_SYSTEM.format(
+                domain=spec.domain, charter=spec.charter,
+                server_guidance=_server_guidance(spec, instructions)),
             messages=[{"role": "user", "content": question}],
             tools=tools,
             model=model,
@@ -259,6 +282,14 @@ async def run_subagent(spec: ServerSpec, session: ClientSession,
                 continue
 
         record_usage(sp, in_tok, out_tok, model)
+        set_io(sp, output={
+            "answer": answer,
+            "citation_status": citation_check.status,
+            "authorization": authorization,
+            "tool_calls": [{"tool": c["tool"], "args": c["args"],
+                            "reasoning": c.get("explanation"),
+                            "row_count": c.get("row_count"), "sql": c.get("sql")}
+                           for c in calls]})
         sp.set_attribute("proof.tool_calls", len(calls))
         sp.set_attribute("proof.citation_status", citation_check.status)
 

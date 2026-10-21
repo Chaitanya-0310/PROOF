@@ -221,6 +221,11 @@ def _cacheable(result: SubAgentResult) -> bool:
     # model fault; caching it would replay the failure for the whole TTL.
     if result.answer.lstrip().startswith("[stopped:"):
         return False
+    # A tool that errored (or returned something unreadable) leaves an
+    # `evidence_error` on its call. The answer built on it is a failure
+    # report, and a fixed tool should not have to wait out the TTL.
+    if any(c.get("evidence_error") for c in result.tool_calls):
+        return False
     return True
 
 

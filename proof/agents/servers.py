@@ -79,7 +79,8 @@ SERVERS: dict[str, ServerSpec] = {
         script="production_server.py",
         server_name="proof-production",
         charter=(
-            "Line state, downtime, output-loss arithmetic, alternate-line "
+            "Line state (what each line, or each product category, is "
+            "running now), downtime, output-loss arithmetic, alternate-line "
             "search, and scrap analytics. Owns MES/SCADA. Does NOT know about "
             "perishable WIP expiry, customer orders, or raw materials."
         ),
@@ -124,6 +125,21 @@ SERVERS: dict[str, ServerSpec] = {
             "Quality holds and allergen compatibility rules. Owns the QMS. "
             "Allergen compatibility is a hard constraint on any line move. "
             "(Phase 3 adds SOP retrieval with mandatory citations.)"
+        ),
+    ),
+    "analytics": ServerSpec(
+        domain="analytics",
+        script="analytics_server.py",
+        server_name="proof-analytics",
+        charter=(
+            "Ad-hoc questions no other agent has a tool for: counts, trends, "
+            "rankings, history and comparisons across any plant data (lines, "
+            "runs, downtime, scrap, orders, POs, stock, holds, the approval "
+            "queue), answered by writing read-only SQL over the relevant "
+            "tables. FALLBACK ONLY: the other agents' tools encode business "
+            "rules (the scrap clock, runout, allocation-based impact, SOP "
+            "citations) that ad-hoc SQL would miss, so prefer them for what "
+            "they cover. Cannot write or propose anything."
         ),
     ),
 }
