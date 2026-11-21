@@ -9,6 +9,8 @@ it would have to be built to run inside a real manufacturer: identity from the
 transport, least-privilege database roles, human approval on every write,
 behavioural evals, and tracing.
 
+https://github.com/user-attachments/assets/e9076e1b-e5e9-4aee-9ff8-335ea023cac6
+
 ---
 
 ## Architecture
@@ -54,8 +56,6 @@ flowchart TB
 | **MCP servers** | One process per domain, standing in for a separate system of record. Every tool returns `{rows, row_count, sql, params, note}` and, where totals matter, a computed `summary`. |
 | **Postgres** | Three schemas standing in for three real systems, plus the approval queue. The database roles *are* the security model: the read path cannot write, and the write path can only queue. |
 
-
-https://github.com/user-attachments/assets/e9076e1b-e5e9-4aee-9ff8-335ea023cac6
 
 An interactive version of this diagram, with guided views, is in
 [`docs/diagrams/proof-architecture.html`](docs/diagrams/proof-architecture.html).
